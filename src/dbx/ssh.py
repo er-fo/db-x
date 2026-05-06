@@ -29,7 +29,7 @@ def build_attach_command(target: str, session_name: str) -> list[str]:
 
 def run_ssh_command(target: str, remote_command: str) -> int:
     result = subprocess.run(
-        ["ssh", *SSH_OPTIONS, target, "bash", "-lc", remote_command],
+        ["ssh", *SSH_OPTIONS, target, _remote_bash_command(remote_command)],
         check=False,
     )
     return result.returncode
@@ -46,9 +46,7 @@ def run_remote_shell_command(
         "ssh",
         *SSH_OPTIONS,
         target,
-        "bash",
-        "-lc",
-        shell_command,
+        _remote_bash_command(shell_command),
     ]
     result = subprocess.run(
         command,
@@ -67,9 +65,9 @@ def upload_remote_text(target: str, remote_path: str, content: str) -> None:
         "ssh",
         *SSH_OPTIONS,
         target,
-        "bash",
-        "-lc",
-        f"mkdir -p {shlex.quote(remote_dir)} && cat > {shlex.quote(remote_path)}",
+        _remote_bash_command(
+            f"mkdir -p {shlex.quote(remote_dir)} && cat > {shlex.quote(remote_path)}"
+        ),
     ]
     result = subprocess.run(
         command,
@@ -80,3 +78,7 @@ def upload_remote_text(target: str, remote_path: str, content: str) -> None:
     )
     if result.returncode != 0:
         raise RemoteCommandError(result.stderr.strip() or "Remote upload failed.")
+
+
+def _remote_bash_command(shell_command: str) -> str:
+    return f"bash -lc {shlex.quote(shell_command)}"
