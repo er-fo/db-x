@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "db-x"
+version = "0.1.0"
+description = "Disposable AWS devboxes for long-running Codex and Superpowers missions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Erik Fornlund", email = "206936603+er-fo@users.noreply.github.com" }
+]
+dependencies = []
+
+[project.scripts]
+dbx = "dbx.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
