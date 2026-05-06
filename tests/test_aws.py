@@ -116,7 +116,7 @@ class AwsTests(unittest.TestCase):
             script,
         )
         self.assertIn(
-            '\\"\\$(cat \\"$PROMPT_FILE\\")\\"',
+            '"$(cat "$PROMPT_FILE")"',
             script,
         )
 

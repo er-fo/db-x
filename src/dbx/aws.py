@@ -374,7 +374,7 @@ def _build_bootstrap_prompt() -> str:
 
 
 def _build_codex_command(request: JobLaunchRequest) -> str:
-    prompt_expr = '\\"\\$(cat \\"$PROMPT_FILE\\")\\"'
+    prompt_expr = '"$(cat "$PROMPT_FILE")"'
     if request.resume_session_id:
         session_id = shlex.quote(request.resume_session_id)
         return f"codex --no-alt-screen resume {session_id} {prompt_expr}"
