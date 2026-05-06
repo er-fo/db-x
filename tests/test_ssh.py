@@ -12,7 +12,15 @@ class SshTests(unittest.TestCase):
         command = build_attach_command("ubuntu@dbx-job.tail.ts.net", "dbx-job-123")
         self.assertEqual(
             command,
-            ["ssh", "-t", "ubuntu@dbx-job.tail.ts.net", "tmux attach -t dbx-job-123"],
+            [
+                "tailscale",
+                "ssh",
+                "ubuntu@dbx-job.tail.ts.net",
+                "tmux",
+                "attach",
+                "-t",
+                "dbx-job-123",
+            ],
         )
 
     def test_run_remote_shell_command_uses_bash_login_shell(self) -> None:
@@ -28,11 +36,8 @@ class SshTests(unittest.TestCase):
         self.assertEqual(result.stdout, "ok")
         run.assert_called_once_with(
             [
+                "tailscale",
                 "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=10",
                 "ubuntu@dbx-job.tail.ts.net",
                 "bash",
                 "-lc",

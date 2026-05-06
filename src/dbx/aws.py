@@ -67,6 +67,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     log_file = f"{log_dir}/codex.log"
     finish_log = f"{log_dir}/finish.log"
     codex_command = _build_codex_command(request)
+    tailscale_tags = ",".join(config.tailscale_tags)
 
     script = [
         "#!/bin/bash",
@@ -87,6 +88,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         f"BRANCH_NAME={shlex.quote(request.branch_name)}",
         f"BASE_BRANCH={shlex.quote(config.default_base_branch)}",
         f"TAILSCALE_AUTH_KEY={shlex.quote(config.tailscale_auth_key or '')}",
+        f'TAILSCALE_TAGS={shlex.quote(tailscale_tags)}',
         "DBX_USER=ubuntu",
         "mkdir -p \"$JOB_ROOT\" \"$LOG_DIR\"",
         "touch \"$FINISH_LOG\"",
@@ -160,7 +162,11 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "if [ -n \"$TAILSCALE_AUTH_KEY\" ]; then",
         "  write_status \"bootstrap\" \"running\" \"connecting tailscale\"",
         "  systemctl start tailscaled",
-        "  tailscale up --ssh --hostname \"$SESSION_NAME\" --auth-key \"$TAILSCALE_AUTH_KEY\"",
+        "  TAILSCALE_UP_ARGS=(--ssh --hostname \"$SESSION_NAME\" --auth-key \"$TAILSCALE_AUTH_KEY\")",
+        "  if [ -n \"$TAILSCALE_TAGS\" ]; then",
+        "    TAILSCALE_UP_ARGS+=(--advertise-tags \"$TAILSCALE_TAGS\")",
+        "  fi",
+        "  tailscale up \"${TAILSCALE_UP_ARGS[@]}\"",
         "fi",
         "write_status \"bootstrap\" \"running\" \"starting tmux codex session\"",
         "sudo -u \"$DBX_USER\" -H tmux new-session -d -s \"$SESSION_NAME\" "

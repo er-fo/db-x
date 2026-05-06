@@ -18,6 +18,7 @@ instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_domain = "tail12345.ts.net"
 tailscale_auth_key = "tskey-auth-xxxxxxxx"
+tailscale_tags = ["tag:dbx"]
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 """
@@ -36,6 +37,7 @@ class AppConfig:
     ssh_user: str
     tailscale_domain: str | None
     tailscale_auth_key: str | None
+    tailscale_tags: tuple[str, ...]
     repo_root: str
     job_prefix: str
 
@@ -77,6 +79,7 @@ def load_config(explicit_path: str | None = None) -> AppConfig:
         tailscale_auth_key=_optional_str(
             os.environ.get("DBX_TAILSCALE_AUTH_KEY", data.get("tailscale_auth_key"))
         ),
+        tailscale_tags=_optional_str_list(data.get("tailscale_tags")),
         repo_root=_required_str(data, "repo_root"),
         job_prefix=_required_str(data, "job_prefix"),
     )
@@ -104,3 +107,19 @@ def _optional_str(value: object) -> str | None:
         raise ValueError("Optional config values must be strings when provided.")
     cleaned = value.strip()
     return cleaned or None
+
+
+def _optional_str_list(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("Optional config list values must be arrays of strings when provided.")
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("Optional config list values must contain only strings.")
+        stripped = item.strip()
+        if not stripped:
+            raise ValueError("Optional config list values cannot contain empty strings.")
+        cleaned.append(stripped)
+    return tuple(cleaned)

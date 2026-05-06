@@ -29,6 +29,7 @@ instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_domain = "tailnet.ts.net"
 tailscale_auth_key = "tskey-auth-123"
+tailscale_tags = ["tag:dbx"]
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 """,
@@ -40,6 +41,7 @@ job_prefix = "dbx"
         self.assertEqual(config.aws_region, "eu-north-1")
         self.assertEqual(config.tailscale_domain, "tailnet.ts.net")
         self.assertEqual(config.tailscale_auth_key, "tskey-auth-123")
+        self.assertEqual(config.tailscale_tags, ("tag:dbx",))
 
     def test_load_config_prefers_env_tailscale_auth_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

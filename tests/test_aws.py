@@ -55,8 +55,10 @@ class AwsTests(unittest.TestCase):
         self.assertIn("logs/finish.log", script)
         self.assertIn("BLOCKER.md", script)
         self.assertIn("trap '", script)
-        self.assertIn("tailscale up --ssh", script)
+        self.assertIn("TAILSCALE_UP_ARGS=(--ssh", script)
         self.assertIn("TAILSCALE_AUTH_KEY", script)
+        self.assertIn("TAILSCALE_TAGS=tag:dbx", script)
+        self.assertIn('--advertise-tags "$TAILSCALE_TAGS"', script)
         self.assertIn("--hostname \"$SESSION_NAME\"", script)
         self.assertIn("gh auth setup-git", script)
         self.assertIn("sudo -u \"$DBX_USER\" -H git clone", script)
@@ -128,6 +130,7 @@ security_group_id = "sg-123"
 instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_auth_key = "tskey-auth-123"
+tailscale_tags = ["tag:dbx"]
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 """

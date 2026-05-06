@@ -9,12 +9,14 @@ class RemoteCommandError(RuntimeError):
 
 
 def build_attach_command(target: str, session_name: str) -> list[str]:
-    remote = f"tmux attach -t {shlex.quote(session_name)}"
-    return ["ssh", "-t", target, remote]
+    return ["tailscale", "ssh", target, "tmux", "attach", "-t", session_name]
 
 
 def run_ssh_command(target: str, remote_command: str) -> int:
-    result = subprocess.run(["ssh", target, remote_command], check=False)
+    result = subprocess.run(
+        ["tailscale", "ssh", target, "bash", "-lc", remote_command],
+        check=False,
+    )
     return result.returncode
 
 
@@ -26,11 +28,8 @@ def run_remote_shell_command(
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     command = [
+        "tailscale",
         "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=10",
         target,
         "bash",
         "-lc",
