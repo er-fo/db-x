@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -54,6 +55,39 @@ class AwsTests(unittest.TestCase):
         self.assertIn("logs/finish.log", script)
         self.assertIn("BLOCKER.md", script)
         self.assertIn("trap '", script)
+        self.assertIn("tailscale up --ssh", script)
+        self.assertIn("TAILSCALE_AUTH_KEY", script)
+        self.assertIn("--hostname \"$SESSION_NAME\"", script)
+        self.assertIn("gh auth setup-git", script)
+        self.assertIn("sudo -u \"$DBX_USER\" -H git clone", script)
+        self.assertIn("sudo -u \"$DBX_USER\" -H tmux new-session", script)
+
+    def test_build_user_data_is_valid_bash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            script_path = Path(tmpdir) / "user-data.sh"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config = load_config(str(config_path))
+            request = JobLaunchRequest(
+                repo="er-fo/db-x",
+                mission_path=mission_path,
+                job_name="dbx-ship-123",
+                branch_name="agent/ship-123",
+                session_name="dbx-ship-123",
+            )
+
+            script_path.write_text(build_user_data(config, request), encoding="utf-8")
+
+            result = subprocess.run(
+                ["bash", "-n", str(script_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
 
 
 def _sample_config() -> str:
@@ -66,6 +100,7 @@ subnet_id = "subnet-123"
 security_group_id = "sg-123"
 instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
+tailscale_auth_key = "tskey-auth-123"
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 """

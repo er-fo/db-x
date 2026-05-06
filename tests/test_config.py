@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from dbx.config import load_config, resolve_config_path
 
@@ -27,6 +28,7 @@ security_group_id = "sg-123"
 instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_domain = "tailnet.ts.net"
+tailscale_auth_key = "tskey-auth-123"
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 """,
@@ -37,6 +39,32 @@ job_prefix = "dbx"
         self.assertEqual(config.aws_profile, "personal")
         self.assertEqual(config.aws_region, "eu-north-1")
         self.assertEqual(config.tailscale_domain, "tailnet.ts.net")
+        self.assertEqual(config.tailscale_auth_key, "tskey-auth-123")
+
+    def test_load_config_prefers_env_tailscale_auth_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                """
+aws_region = "eu-north-1"
+default_owner = "er-fo"
+default_base_branch = "main"
+ami_id = "ami-123"
+subnet_id = "subnet-123"
+security_group_id = "sg-123"
+instance_type = "c7i.xlarge"
+ssh_user = "ubuntu"
+tailscale_domain = "tailnet.ts.net"
+tailscale_auth_key = "tskey-auth-config"
+repo_root = "/home/ubuntu/work"
+job_prefix = "dbx"
+""",
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"DBX_TAILSCALE_AUTH_KEY": "tskey-auth-env"}):
+                config = load_config(str(config_path))
+
+        self.assertEqual(config.tailscale_auth_key, "tskey-auth-env")
 
 
 if __name__ == "__main__":

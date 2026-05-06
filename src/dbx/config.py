@@ -17,6 +17,7 @@ security_group_id = "sg-xxxxxxxxxxxxxxxxx"
 instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_domain = "tail12345.ts.net"
+tailscale_auth_key = "tskey-auth-xxxxxxxx"
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 """
@@ -34,6 +35,7 @@ class AppConfig:
     instance_type: str
     ssh_user: str
     tailscale_domain: str | None
+    tailscale_auth_key: str | None
     repo_root: str
     job_prefix: str
 
@@ -72,6 +74,9 @@ def load_config(explicit_path: str | None = None) -> AppConfig:
         instance_type=_required_str(data, "instance_type"),
         ssh_user=_required_str(data, "ssh_user"),
         tailscale_domain=_optional_str(data.get("tailscale_domain")),
+        tailscale_auth_key=_optional_str(
+            os.environ.get("DBX_TAILSCALE_AUTH_KEY", data.get("tailscale_auth_key"))
+        ),
         repo_root=_required_str(data, "repo_root"),
         job_prefix=_required_str(data, "job_prefix"),
     )
