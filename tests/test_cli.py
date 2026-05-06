@@ -94,6 +94,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("real user request", output)
         self.assertNotIn("subagent_notification", output)
 
+    def test_sessions_exclude_subagent_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="real user session",
+                mtime=100,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfebf-7ab2-74e1-88b1-0c5affae2018",
+                created_at="2026-05-06T21:24:14Z",
+                latest_user_message="You are reviewing the backend spec-first integration",
+                mtime=200,
+                source={"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}},
+            )
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions"])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("real user session", output)
+        self.assertNotIn("You are reviewing", output)
+        self.assertEqual(output.count(".jsonl"), 1)
+
     def test_start_can_pick_resume_session_interactively(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / ".codex" / "sessions"
@@ -156,6 +184,127 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             payload["resume_session_id"],
             "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+
+    def test_start_picker_accepts_arrow_key_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="first visible session",
+                mtime=200,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfe10-8e20-7580-ba09-86c21ace5c81",
+                created_at="2026-05-06T18:13:11Z",
+                latest_user_message="second visible session",
+                mtime=100,
+            )
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            stdin = _TTYInput("\x1b[B\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()):
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "start",
+                                                    "er-fo/db-x",
+                                                    str(mission_path),
+                                                    "--pick-session",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Use ↑/↓", stderr.getvalue())
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfe10-8e20-7580-ba09-86c21ace5c81",
+        )
+
+    def test_start_picker_accepts_pasted_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="first visible session",
+                mtime=200,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfe10-8e20-7580-ba09-86c21ace5c81",
+                created_at="2026-05-06T18:13:11Z",
+                latest_user_message="second visible session",
+                mtime=100,
+            )
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            stdin = _TTYInput("019dfe10-8e20-7580-ba09-86c21ace5c81\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()):
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()):
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "start",
+                                                    "er-fo/db-x",
+                                                    str(mission_path),
+                                                    "--pick-session",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfe10-8e20-7580-ba09-86c21ace5c81",
         )
 
     def test_start_pick_session_fails_when_not_interactive(self) -> None:
@@ -704,6 +853,7 @@ def _write_codex_session(
     latest_user_message: str,
     mtime: int,
     extra_user_message: str | None = None,
+    source: object = "cli",
 ) -> Path:
     date_part, time_part = created_at.removesuffix("Z").split("T")
     year, month, day = date_part.split("-")
@@ -718,6 +868,16 @@ def _write_codex_session(
                 "timestamp": created_at,
                 "cwd": "/tmp/repo",
                 "git": {"branch": "main"},
+                "source": source,
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": created_at,
+            "payload": {
+                "type": "user_message",
+                "message": latest_user_message,
+                "text_elements": [],
             },
         },
         {

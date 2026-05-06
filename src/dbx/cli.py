@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,7 +11,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import termios
 import time
+import tty
 
 from .aws import (
     AwsCliError,
@@ -476,18 +479,21 @@ def _discover_codex_sessions(limit: int | None = None) -> list[CodexSession]:
         candidates.append((stat.st_mtime, path, session_id, relative_path, stat.st_size))
 
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-    if limit is not None:
-        candidates = candidates[:limit]
-    return [
-        _load_codex_session(
+    sessions: list[CodexSession] = []
+    for mtime, path, session_id, relative_path, size_bytes in candidates:
+        session = _load_codex_session(
             path=path,
             session_id=session_id,
             relative_path=relative_path,
             updated_at=datetime.fromtimestamp(mtime, UTC).isoformat(),
             size_bytes=size_bytes,
         )
-        for mtime, path, session_id, relative_path, size_bytes in candidates
-    ]
+        if session is None or not session.latest_user_message:
+            continue
+        sessions.append(session)
+        if limit is not None and len(sessions) >= limit:
+            break
+    return sessions
 
 
 def _session_display_limit(limit: int | None) -> int:
@@ -503,7 +509,7 @@ def _load_codex_session(
     relative_path: str,
     updated_at: str,
     size_bytes: int,
-) -> CodexSession:
+) -> CodexSession | None:
     created_at = updated_at
     branch = "-"
     latest_user_message = ""
@@ -521,14 +527,16 @@ def _load_codex_session(
                 if not isinstance(payload, dict):
                     continue
                 if record.get("type") == "session_meta":
+                    if _is_subagent_source(payload.get("source")):
+                        return None
                     created_at = _normalize_timestamp(
                         _optional_text(payload.get("timestamp"))
                         or _optional_text(record.get("timestamp"))
                         or created_at
                     )
                     branch = _extract_branch(payload) or branch
-                if record.get("type") == "response_item" and payload.get("role") == "user":
-                    message = _extract_user_message(payload)
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = _extract_event_user_message(payload)
                     if message:
                         latest_user_message = message
     except OSError:
@@ -562,20 +570,19 @@ def _extract_branch(payload: dict[str, object]) -> str | None:
     return None
 
 
-def _extract_user_message(payload: dict[str, object]) -> str:
-    content = payload.get("content")
-    parts: list[str] = []
-    if isinstance(content, str):
-        parts.append(content)
-    elif isinstance(content, list):
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
-    return _clean_user_message(" ".join(parts))
+def _is_subagent_source(source: object) -> bool:
+    return isinstance(source, dict) and "subagent" in source
+
+
+def _extract_event_user_message(payload: dict[str, object]) -> str:
+    message = payload.get("message")
+    if isinstance(message, str):
+        return _clean_user_message(message)
+    text_elements = payload.get("text_elements")
+    if isinstance(text_elements, list):
+        parts = [part for part in text_elements if isinstance(part, str)]
+        return _clean_user_message(" ".join(parts))
+    return ""
 
 
 def _clean_user_message(text: str) -> str:
@@ -602,17 +609,22 @@ def _parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _format_codex_sessions(sessions: list[CodexSession]) -> str:
+def _format_codex_sessions(
+    sessions: list[CodexSession],
+    *,
+    selected_index: int | None = None,
+) -> str:
     if not sessions:
         return f"No local Codex sessions found under {_codex_sessions_root()}.\n"
 
-    lines = [f"{'#':<3}{'Created':<15}{'Updated':<15}{'Branch':<12}Conversation"]
+    lines = [f"{'':<2}{'#':<3}{'Created':<15}{'Updated':<15}{'Branch':<12}Conversation"]
     for index, session in enumerate(sessions, start=1):
+        marker = ">" if selected_index == index - 1 else " "
         created = _relative_time(session.created_at)
         updated = _relative_time(session.updated_at)
         branch = _truncate(session.branch or "-", 11)
         conversation = _truncate(session.latest_user_message or "(no user message)", 72)
-        lines.append(f"{index:<3}{created:<15}{updated:<15}{branch:<12}{conversation}")
+        lines.append(f"{marker} {index:<3}{created:<15}{updated:<15}{branch:<12}{conversation}")
         lines.append(f"   {session.path}")
     return "\n".join(lines) + "\n"
 
@@ -654,25 +666,128 @@ def _pick_codex_session() -> CodexSession:
     if not sessions:
         raise ValueError(f"No local Codex sessions found under {_codex_sessions_root()}.")
 
-    print("Local Codex sessions:", file=sys.stderr)
-    print(_format_codex_sessions(sessions), end="", file=sys.stderr)
+    return _run_codex_session_picker(sessions, sys.stdin, sys.stderr)
 
-    while True:
-        print("Select session number: ", end="", file=sys.stderr, flush=True)
-        answer = sys.stdin.readline()
-        if answer == "":
-            raise ValueError("No Codex session selected.")
-        cleaned = answer.strip()
-        if not cleaned:
-            continue
-        try:
-            selection = int(cleaned)
-        except ValueError:
-            print("Enter a number from the list.", file=sys.stderr)
-            continue
-        if 1 <= selection <= len(sessions):
-            return sessions[selection - 1]
-        print("Enter a number from the list.", file=sys.stderr)
+
+def _run_codex_session_picker(
+    sessions: list[CodexSession],
+    input_stream,
+    output_stream,
+) -> CodexSession:
+    selected_index = 0
+    typed = ""
+    use_screen = _stream_is_tty(output_stream)
+
+    with _raw_terminal(input_stream):
+        while True:
+            _render_codex_session_picker(
+                sessions,
+                selected_index=selected_index,
+                typed=typed,
+                output_stream=output_stream,
+                clear_screen=use_screen,
+            )
+            key = _read_picker_key(input_stream)
+            if key == "down":
+                selected_index = min(selected_index + 1, len(sessions) - 1)
+                typed = ""
+            elif key == "up":
+                selected_index = max(selected_index - 1, 0)
+                typed = ""
+            elif key == "enter":
+                if typed:
+                    matched = _match_session_selection(typed, sessions)
+                    if matched is not None:
+                        return matched
+                    print("No matching session. Use arrows, a number, or paste a session ID/path.", file=output_stream)
+                    typed = ""
+                    continue
+                return sessions[selected_index]
+            elif key in {"escape", "q"} and not typed:
+                raise ValueError("No Codex session selected.")
+            elif key == "backspace":
+                typed = typed[:-1]
+            elif len(key) == 1 and key.isprintable():
+                typed += key
+
+
+def _render_codex_session_picker(
+    sessions: list[CodexSession],
+    *,
+    selected_index: int,
+    typed: str,
+    output_stream,
+    clear_screen: bool,
+) -> None:
+    if clear_screen:
+        output_stream.write("\033[2J\033[H")
+    output_stream.write("Local Codex sessions\n")
+    output_stream.write("Use ↑/↓ to choose, Enter to launch, q to cancel.\n")
+    output_stream.write("You can also paste a session ID or path, then press Enter.\n\n")
+    output_stream.write(_format_codex_sessions(sessions, selected_index=selected_index))
+    if typed:
+        output_stream.write(f"\nSelection: {typed}\n")
+    output_stream.flush()
+
+
+@contextmanager
+def _raw_terminal(input_stream):
+    try:
+        fd = input_stream.fileno()
+        original = termios.tcgetattr(fd)
+    except (AttributeError, OSError, termios.error, ValueError):
+        yield
+        return
+
+    try:
+        tty.setcbreak(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
+def _read_picker_key(input_stream) -> str:
+    char = input_stream.read(1)
+    if char in {"\n", "\r"}:
+        return "enter"
+    if char in {"\x7f", "\b"}:
+        return "backspace"
+    if char == "\x1b":
+        suffix = input_stream.read(2)
+        if suffix in {"[A", "OA"}:
+            return "up"
+        if suffix in {"[B", "OB"}:
+            return "down"
+        return "escape"
+    if char == "":
+        return "enter"
+    if char in {"q", "Q"}:
+        return "q"
+    return char
+
+
+def _match_session_selection(selection: str, sessions: list[CodexSession]) -> CodexSession | None:
+    cleaned = selection.strip()
+    if not cleaned:
+        return None
+    if cleaned.isdigit():
+        index = int(cleaned)
+        if 1 <= index <= len(sessions):
+            return sessions[index - 1]
+    match = SESSION_ID_RE.search(cleaned)
+    if match:
+        session_id = match.group(1).lower()
+        for session in sessions:
+            if session.session_id == session_id:
+                return session
+    for session in sessions:
+        if cleaned in {str(session.path), session.relative_path}:
+            return session
+    return None
+
+
+def _stream_is_tty(stream) -> bool:
+    return bool(getattr(stream, "isatty", lambda: False)())
 
 
 def _find_codex_session_file(session_id: str) -> Path | None:

@@ -45,8 +45,10 @@ dbx terminate i-0123456789abcdef0
 Use `dbx sessions` to inspect the latest local Codex sessions before launching.
 It prints a simple 10-row table with created time, updated time, branch, full
 session path, and latest user message. Use `--pick-session` when you want
-`dbx start` to show the same table and let you choose one interactively.
-`--resume-session <session-id>` remains available for scripted launches.
+`dbx start` to show an arrow-key picker over the same table. The picker also
+accepts a pasted session ID or path. Subagent sessions are excluded, so the list
+shows direct user-submitted conversations. `--resume-session <session-id>`
+remains available for scripted launches.
 
 `dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
 
