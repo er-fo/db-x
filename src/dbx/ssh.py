@@ -11,9 +11,13 @@ class RemoteCommandError(RuntimeError):
 
 SSH_OPTIONS = [
     "-o",
+    "ProxyCommand=tailscale nc %h %p",
+    "-o",
     "BatchMode=yes",
     "-o",
     "StrictHostKeyChecking=accept-new",
+    "-o",
+    "ServerAliveInterval=15",
     "-o",
     "ConnectTimeout=20",
 ]
