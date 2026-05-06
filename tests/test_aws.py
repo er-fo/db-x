@@ -31,6 +31,30 @@ class AwsTests(unittest.TestCase):
         self.assertIn("codex --no-alt-screen", script)
         self.assertIn("AGENT_MISSION.md", script)
 
+    def test_build_user_data_writes_explicit_status_and_log_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config = load_config(str(config_path))
+            request = JobLaunchRequest(
+                repo="er-fo/db-x",
+                mission_path=mission_path,
+                job_name="dbx-ship-123",
+                branch_name="agent/ship-123",
+                session_name="dbx-ship-123",
+            )
+
+            script = build_user_data(config, request)
+
+        self.assertIn("status.json", script)
+        self.assertIn("logs/bootstrap.log", script)
+        self.assertIn("logs/codex.log", script)
+        self.assertIn("logs/finish.log", script)
+        self.assertIn("BLOCKER.md", script)
+        self.assertIn("trap '", script)
+
 
 def _sample_config() -> str:
     return """

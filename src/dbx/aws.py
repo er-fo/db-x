@@ -6,6 +6,7 @@ import json
 import shlex
 import subprocess
 import tempfile
+import time
 
 from .config import AppConfig
 
@@ -57,8 +58,13 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     repo_dir = f"{job_root}/repo"
     mission_file = f"{job_root}/AGENT_MISSION.md"
     status_file = f"{job_root}/STATUS.md"
+    status_json = f"{job_root}/status.json"
+    blocker_file = f"{job_root}/BLOCKER.md"
     prompt_file = f"{job_root}/BOOTSTRAP_PROMPT.txt"
-    log_file = f"{job_root}/codex.log"
+    log_dir = f"{job_root}/logs"
+    bootstrap_log = f"{log_dir}/bootstrap.log"
+    log_file = f"{log_dir}/codex.log"
+    finish_log = f"{log_dir}/finish.log"
 
     script = [
         "#!/bin/bash",
@@ -67,28 +73,69 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         f"REPO_DIR={shlex.quote(repo_dir)}",
         f"MISSION_FILE={shlex.quote(mission_file)}",
         f"STATUS_FILE={shlex.quote(status_file)}",
+        f"STATUS_JSON={shlex.quote(status_json)}",
+        f"BLOCKER_FILE={shlex.quote(blocker_file)}",
         f"PROMPT_FILE={shlex.quote(prompt_file)}",
+        f"LOG_DIR={shlex.quote(log_dir)}",
+        f"BOOTSTRAP_LOG={shlex.quote(bootstrap_log)}",
         f"LOG_FILE={shlex.quote(log_file)}",
+        f"FINISH_LOG={shlex.quote(finish_log)}",
         f"SESSION_NAME={shlex.quote(request.session_name)}",
         f"REPO_CLONE_URL={shlex.quote(repo_clone_url)}",
         f"BRANCH_NAME={shlex.quote(request.branch_name)}",
         f"BASE_BRANCH={shlex.quote(config.default_base_branch)}",
-        "mkdir -p \"$JOB_ROOT\"",
+        "mkdir -p \"$JOB_ROOT\" \"$LOG_DIR\"",
+        "touch \"$FINISH_LOG\"",
+        "exec > >(tee -a \"$BOOTSTRAP_LOG\") 2>&1",
+        "write_status() {",
+        "  local phase=\"$1\"",
+        "  local state=\"$2\"",
+        "  local detail=\"${3:-}\"",
+        "  cat >\"$STATUS_JSON\" <<EOF",
+        "{",
+        "  \"job_name\": \"$SESSION_NAME\",",
+        "  \"phase\": \"$phase\",",
+        "  \"state\": \"$state\",",
+        "  \"repo\": \"" + request.repo + "\",",
+        "  \"branch_name\": \"" + request.branch_name + "\",",
+        "  \"session_name\": \"" + request.session_name + "\",",
+        "  \"detail\": \"$detail\"",
+        "}",
+        "EOF",
+        "  cat >\"$STATUS_FILE\" <<EOF",
+        "# " + request.job_name,
+        "",
+        "- Repo: `" + request.repo + "`",
+        "- Branch: `" + request.branch_name + "`",
+        "- Session: `" + request.session_name + "`",
+        "- Phase: $phase",
+        "- State: $state",
+        "- Detail: $detail",
+        "",
+        "EOF",
+        "}",
+        "on_error() {",
+        "  local exit_code=$?",
+        "  write_status \"bootstrap\" \"failed\" \"bootstrap_failed_exit_${exit_code}\"",
+        "  if [ ! -f \"$BLOCKER_FILE\" ]; then",
+        "    cat >\"$BLOCKER_FILE\" <<EOF",
+        "# Bootstrap blocker",
+        "",
+        "Cloud-init failed before the runtime reached a healthy state.",
+        "Check logs/bootstrap.log and the EC2 console output for details.",
+        "EOF",
+        "  fi",
+        "  exit \"$exit_code\"",
+        "}",
+        "trap 'on_error' ERR",
+        "write_status \"bootstrap\" \"starting\" \"initializing job root\"",
         "cat >\"$MISSION_FILE\" <<'" + mission_marker + "'",
         mission_text,
         mission_marker,
         "cat >\"$PROMPT_FILE\" <<'" + prompt_marker + "'",
         bootstrap_prompt,
         prompt_marker,
-        "cat >\"$STATUS_FILE\" <<'STATUS_EOF'",
-        f"# {request.job_name}",
-        "",
-        f"- Repo: `{request.repo}`",
-        f"- Branch: `{request.branch_name}`",
-        f"- Session: `{request.session_name}`",
-        "- State: bootstrapping",
-        "",
-        "STATUS_EOF",
+        "write_status \"bootstrap\" \"running\" \"cloning repository\"",
         "if [ ! -d \"$REPO_DIR/.git\" ]; then",
         "  git clone \"$REPO_CLONE_URL\" \"$REPO_DIR\"",
         "fi",
@@ -96,12 +143,11 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "git fetch origin --prune",
         "git checkout -B \"$BRANCH_NAME\" \"origin/$BASE_BRANCH\"",
         "cp \"$MISSION_FILE\" \"$REPO_DIR/AGENT_MISSION.md\"",
+        "write_status \"bootstrap\" \"running\" \"starting tmux codex session\"",
         "tmux new-session -d -s \"$SESSION_NAME\" "
         "\"cd '$REPO_DIR' && codex --no-alt-screen \\\"\\$(cat '$PROMPT_FILE')\\\" "
         "2>&1 | tee '$LOG_FILE'; exec bash\"",
-        "printf '%s\\n' 'State: running' > /tmp/dbx-status.tmp",
-        "cat \"$STATUS_FILE\" | sed 's/State: bootstrapping/State: running/' > /tmp/dbx-status.tmp",
-        "mv /tmp/dbx-status.tmp \"$STATUS_FILE\"",
+        "write_status \"runtime\" \"ready\" \"tmux session started\"",
     ]
     return "\n".join(script)
 
@@ -202,6 +248,61 @@ def terminate_instance(config: AppConfig, instance_id: str) -> dict[str, object]
     return json.loads(result.stdout)
 
 
+def describe_instance_status(config: AppConfig, instance_id: str) -> dict[str, object] | None:
+    result = run_aws_cli(
+        config,
+        [
+            "ec2",
+            "describe-instance-status",
+            "--include-all-instances",
+            "--instance-ids",
+            instance_id,
+            "--output",
+            "json",
+        ],
+    )
+    payload = json.loads(result.stdout)
+    statuses = payload.get("InstanceStatuses", [])
+    if not statuses:
+        return None
+    return statuses[0]
+
+
+def get_console_output(config: AppConfig, instance_id: str) -> str:
+    result = run_aws_cli(
+        config,
+        [
+            "ec2",
+            "get-console-output",
+            "--latest",
+            "--instance-id",
+            instance_id,
+            "--output",
+            "json",
+        ],
+    )
+    payload = json.loads(result.stdout)
+    output = payload.get("Output")
+    return output if isinstance(output, str) else ""
+
+
+def wait_for_instance_terminated(
+    config: AppConfig,
+    instance_id: str,
+    *,
+    timeout_seconds: int = 600,
+    poll_interval_seconds: int = 5,
+) -> dict[str, object]:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        instance = describe_instance(config, instance_id)
+        state = ((instance.get("State") or {}).get("Name"))
+        if state == "terminated":
+            return instance
+        time.sleep(poll_interval_seconds)
+    raise AwsCliError(f"Timed out waiting for instance {instance_id} to terminate.")
+
+
 def build_ssh_target(config: AppConfig, instance: dict[str, object]) -> str:
     hostname = _find_tag(instance, "Name") or instance.get("PrivateDnsName")
     if not isinstance(hostname, str) or not hostname:
@@ -237,7 +338,8 @@ def _build_bootstrap_prompt() -> str:
             "4. Verifying changes before concluding a checkpoint.",
             "",
             "If you are blocked by missing product intent, credentials, external access, or repeated verification failure:",
-            "- update STATUS.md with the blocker and current state",
+            "- update STATUS.md and status.json with the blocker and current state",
+            "- write a concise summary into BLOCKER.md",
             "- leave the branch in a resumable state",
             "- stop and wait in tmux",
         ]
