@@ -67,7 +67,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     bootstrap_log = f"{log_dir}/bootstrap.log"
     log_file = f"{log_dir}/codex.log"
     finish_log = f"{log_dir}/finish.log"
-    codex_command = _build_codex_command(request, prompt_file)
+    codex_command = _build_codex_command(request, prompt_file, repo_dir)
     resume_session_remote_path = _remote_codex_session_path(
         config, request.resume_session_relative_path
     )
@@ -415,9 +415,12 @@ def _build_bootstrap_prompt() -> str:
     )
 
 
-def _build_codex_command(request: JobLaunchRequest, prompt_file: str) -> str:
+def _build_codex_command(request: JobLaunchRequest, prompt_file: str, repo_dir: str) -> str:
     prompt_expr = f'"$(cat {shlex.quote(prompt_file)})"'
-    codex = "codex --no-alt-screen --ask-for-approval never --sandbox danger-full-access"
+    codex = (
+        "codex --no-alt-screen --ask-for-approval never "
+        f"--sandbox danger-full-access -C {shlex.quote(repo_dir)}"
+    )
     if request.resume_session_id:
         session_id = shlex.quote(request.resume_session_id)
         return f"{codex} resume {session_id} {prompt_expr}"

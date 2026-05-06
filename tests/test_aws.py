@@ -133,7 +133,7 @@ class AwsTests(unittest.TestCase):
             script = build_user_data(config, request)
 
         self.assertIn(
-            'codex --no-alt-screen --ask-for-approval never --sandbox danger-full-access resume 019dfdac-5bea-71f0-91c5-4fdd8826860b',
+            'codex --no-alt-screen --ask-for-approval never --sandbox danger-full-access -C /home/ubuntu/work/dbx-ship-123/repo resume 019dfdac-5bea-71f0-91c5-4fdd8826860b',
             script,
         )
         self.assertIn(
