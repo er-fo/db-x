@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 import json
@@ -37,6 +37,31 @@ from .state import (
 )
 
 
+PICK_SESSION = "__dbx_pick_session__"
+SESSION_ID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+@dataclass(frozen=True)
+class CodexSession:
+    session_id: str
+    path: Path
+    relative_path: str
+    modified_at: str
+    size_bytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "path": str(self.path),
+            "relative_path": self.relative_path,
+            "modified_at": self.modified_at,
+            "size_bytes": self.size_bytes,
+        }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -45,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_doctor(args.config)
     if args.command == "init-config":
         return run_init_config(args.config, args.force)
+    if args.command == "sessions":
+        return run_sessions(args.limit)
 
     try:
         config = load_config(args.config)
@@ -59,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.repo,
                 args.mission,
                 resume_session_id=args.resume_session,
+                pick_session=args.pick_session,
                 wait=args.wait,
                 timeout_seconds=args.timeout,
             )
@@ -112,12 +140,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite an existing config file.",
     )
 
+    sessions_parser = subparsers.add_parser(
+        "sessions", help="List local Codex sessions that dbx can resume."
+    )
+    sessions_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Maximum number of sessions to show. Defaults to all sessions.",
+    )
+
     start_parser = subparsers.add_parser("start", help="Launch a new job instance.")
     start_parser.add_argument("repo", help="GitHub repo in owner/name format.")
     start_parser.add_argument("mission", help="Path to a mission markdown file.")
     start_parser.add_argument(
         "--resume-session",
+        nargs="?",
+        const=PICK_SESSION,
+        metavar="SESSION_ID",
         help="Resume an existing Codex session UUID instead of starting a fresh one.",
+    )
+    start_parser.add_argument(
+        "--pick-session",
+        action="store_true",
+        help="Pick a local Codex session interactively and resume it.",
     )
     start_parser.add_argument(
         "--wait",
@@ -253,12 +298,19 @@ def run_init_config(config_path: str | None, force: bool) -> int:
     return 0
 
 
+def run_sessions(limit: int | None = None) -> int:
+    sessions = _discover_codex_sessions(limit=limit)
+    print(json.dumps([session.to_dict() for session in sessions], indent=2))
+    return 0
+
+
 def run_start(
     config: AppConfig,
     repo: str,
     mission: str,
     *,
     resume_session_id: str | None = None,
+    pick_session: bool = False,
     wait: bool = True,
     timeout_seconds: int = 600,
 ) -> int:
@@ -268,6 +320,19 @@ def run_start(
         return 2
     if "/" not in repo:
         repo = f"{config.default_owner}/{repo}"
+    if resume_session_id == PICK_SESSION:
+        resume_session_id = None
+        pick_session = True
+    if pick_session and resume_session_id:
+        print("Use either --pick-session or --resume-session SESSION_ID, not both.", file=sys.stderr)
+        return 2
+    if pick_session:
+        try:
+            selected_session = _pick_codex_session()
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        resume_session_id = selected_session.session_id
 
     slug = _slugify(mission_path.stem)
     timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
@@ -373,18 +438,88 @@ def run_list(config: AppConfig) -> int:
     return 0
 
 
-def _find_codex_session_file(session_id: str) -> Path | None:
-    root = Path.home() / ".codex" / "sessions"
+def _codex_sessions_root() -> Path:
+    return Path.home() / ".codex" / "sessions"
+
+
+def _discover_codex_sessions(limit: int | None = None) -> list[CodexSession]:
+    root = _codex_sessions_root()
     if not root.exists():
-        return None
-    matches = list(root.rglob(f"*{session_id}.jsonl"))
-    if not matches:
-        return None
-    return max(matches, key=lambda path: path.stat().st_mtime)
+        return []
+
+    sessions: list[CodexSession] = []
+    for path in root.rglob("*.jsonl"):
+        session_id = _extract_session_id(path)
+        if not session_id:
+            continue
+        stat = path.stat()
+        try:
+            relative_path = path.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            relative_path = path.name
+        sessions.append(
+            CodexSession(
+                session_id=session_id,
+                path=path,
+                relative_path=relative_path,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                size_bytes=stat.st_size,
+            )
+        )
+
+    sessions.sort(key=lambda session: session.modified_at, reverse=True)
+    if limit is not None:
+        return sessions[:limit]
+    return sessions
+
+
+def _extract_session_id(path: Path) -> str | None:
+    match = SESSION_ID_RE.search(path.name)
+    return match.group(1).lower() if match else None
+
+
+def _pick_codex_session() -> CodexSession:
+    if not sys.stdin.isatty():
+        raise ValueError("Cannot pick a Codex session without an interactive terminal.")
+
+    sessions = _discover_codex_sessions()
+    if not sessions:
+        raise ValueError(f"No local Codex sessions found under {_codex_sessions_root()}.")
+
+    print("Local Codex sessions:", file=sys.stderr)
+    for index, session in enumerate(sessions, start=1):
+        print(f"{index}. {session.modified_at}  {session.session_id}", file=sys.stderr)
+        print(f"   {session.path}", file=sys.stderr)
+
+    while True:
+        print("Select session number: ", end="", file=sys.stderr, flush=True)
+        answer = sys.stdin.readline()
+        if answer == "":
+            raise ValueError("No Codex session selected.")
+        cleaned = answer.strip()
+        if not cleaned:
+            continue
+        try:
+            selection = int(cleaned)
+        except ValueError:
+            print("Enter a number from the list.", file=sys.stderr)
+            continue
+        if 1 <= selection <= len(sessions):
+            return sessions[selection - 1]
+        print("Enter a number from the list.", file=sys.stderr)
+
+
+def _find_codex_session_file(session_id: str) -> Path | None:
+    matches = [
+        session.path
+        for session in _discover_codex_sessions()
+        if session.session_id == session_id.lower()
+    ]
+    return matches[0] if matches else None
 
 
 def _codex_session_relative_path(session_file: Path) -> str:
-    root = Path.home() / ".codex" / "sessions"
+    root = _codex_sessions_root()
     return session_file.expanduser().resolve().relative_to(root.expanduser().resolve()).as_posix()
 
 

@@ -30,8 +30,9 @@ a real devbox without leaving compute running between jobs.
 ```bash
 dbx init-config
 dbx doctor
+dbx sessions
 dbx start er-fo/db-x missions/bootstrap.md
-dbx start er-fo/db-x missions/bootstrap.md --resume-session 00000000-0000-0000-0000-000000000000
+dbx start er-fo/db-x missions/bootstrap.md --pick-session
 dbx list
 dbx status i-0123456789abcdef0
 dbx status i-0123456789abcdef0 --logs
@@ -40,6 +41,11 @@ dbx attach i-0123456789abcdef0 --check
 dbx finish i-0123456789abcdef0
 dbx terminate i-0123456789abcdef0
 ```
+
+Use `dbx sessions` to inspect local Codex sessions before launching. Use
+`--pick-session` when you want `dbx start` to show the local sessions and let
+you choose one interactively. `--resume-session <session-id>` remains available
+for scripted launches.
 
 `dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
 

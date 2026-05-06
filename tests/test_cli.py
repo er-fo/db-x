@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,10 +14,130 @@ from dbx.state import JobState
 
 
 class CliTests(unittest.TestCase):
+    def test_sessions_lists_local_codex_sessions_with_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            session_a = root / "2026" / "05" / "06" / (
+                "rollout-2026-05-06T21-11-54-"
+                "019dfeb4-2e25-7173-8ab9-006893040db2.jsonl"
+            )
+            session_b = root / "2026" / "05" / "05" / (
+                "rollout-2026-05-05T19-00-00-"
+                "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+            )
+            session_a.parent.mkdir(parents=True)
+            session_b.parent.mkdir(parents=True)
+            session_a.write_text("{}\n", encoding="utf-8")
+            session_b.write_text("{}\n", encoding="utf-8")
+            session_a.touch()
+            session_b.touch()
+            os.utime(session_a, (200, 200))
+            os.utime(session_b, (100, 100))
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions"])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 2)
+        self.assertEqual(
+            payload[0]["session_id"],
+            "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+        self.assertTrue(payload[0]["path"].endswith(str(session_a)))
+        self.assertEqual(
+            payload[1]["relative_path"],
+            "2026/05/05/rollout-2026-05-05T19-00-00-019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl",
+        )
+
+    def test_start_can_pick_resume_session_interactively(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            picked_session = root / "2026" / "05" / "06" / (
+                "rollout-2026-05-06T21-11-54-"
+                "019dfeb4-2e25-7173-8ab9-006893040db2.jsonl"
+            )
+            picked_session.parent.mkdir(parents=True)
+            picked_session.write_text("{}\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            stdin = _TTYInput("1\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "start",
+                                                    "er-fo/db-x",
+                                                    str(mission_path),
+                                                    "--pick-session",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Local Codex sessions", stderr.getvalue())
+        self.assertIn(str(picked_session), stderr.getvalue())
+        self.assertTrue(saved_jobs)
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["resume_session_id"],
+            "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+
+    def test_start_pick_session_fails_when_not_interactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch("sys.stdin", new=io.StringIO("")):
+                with patch("sys.stderr", new=io.StringIO()) as stderr:
+                    exit_code = cli.main(
+                        [
+                            "--config",
+                            str(config_path),
+                            "start",
+                            "er-fo/db-x",
+                            str(mission_path),
+                            "--pick-session",
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("Cannot pick a Codex session without an interactive terminal", stderr.getvalue())
+
     def test_doctor_fails_without_config(self) -> None:
-        with patch("dbx.cli.shutil.which", return_value="/usr/bin/fake"):
-            with patch("sys.stdout", new=io.StringIO()) as stdout:
-                exit_code = cli.main(["doctor"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "missing.toml"
+            with patch("dbx.cli.shutil.which", return_value="/usr/bin/fake"):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["--config", str(config_path), "doctor"])
         self.assertEqual(exit_code, 1)
         self.assertIn('"config_ok": false', stdout.getvalue())
 
@@ -525,3 +646,8 @@ def _sample_job_state() -> JobState:
         lifecycle_state="running",
         status="ready",
     )
+
+
+class _TTYInput(io.StringIO):
+    def isatty(self) -> bool:
+        return True
