@@ -89,6 +89,33 @@ class AwsTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_build_user_data_uses_codex_resume_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config = load_config(str(config_path))
+            request = JobLaunchRequest(
+                repo="er-fo/db-x",
+                mission_path=mission_path,
+                job_name="dbx-ship-123",
+                branch_name="agent/ship-123",
+                session_name="dbx-ship-123",
+                resume_session_id="019dfdac-5bea-71f0-91c5-4fdd8826860b",
+            )
+
+            script = build_user_data(config, request)
+
+        self.assertIn(
+            'codex --no-alt-screen resume 019dfdac-5bea-71f0-91c5-4fdd8826860b',
+            script,
+        )
+        self.assertIn(
+            '\\"\\$(cat \\"$PROMPT_FILE\\")\\"',
+            script,
+        )
+
 
 def _sample_config() -> str:
     return """

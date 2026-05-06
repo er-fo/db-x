@@ -22,6 +22,7 @@ class JobLaunchRequest:
     job_name: str
     branch_name: str
     session_name: str
+    resume_session_id: str | None = None
 
 
 def run_aws_cli(
@@ -65,6 +66,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     bootstrap_log = f"{log_dir}/bootstrap.log"
     log_file = f"{log_dir}/codex.log"
     finish_log = f"{log_dir}/finish.log"
+    codex_command = _build_codex_command(request)
 
     script = [
         "#!/bin/bash",
@@ -162,7 +164,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "fi",
         "write_status \"bootstrap\" \"running\" \"starting tmux codex session\"",
         "sudo -u \"$DBX_USER\" -H tmux new-session -d -s \"$SESSION_NAME\" "
-        "\"cd '$REPO_DIR' && codex --no-alt-screen \\\"\\$(cat '$PROMPT_FILE')\\\" "
+        f"\"cd '$REPO_DIR' && {codex_command} "
         "2>&1 | tee '$LOG_FILE'; exec bash\"",
         "write_status \"runtime\" \"ready\" \"tmux session started\"",
     ]
@@ -361,3 +363,11 @@ def _build_bootstrap_prompt() -> str:
             "- stop and wait in tmux",
         ]
     )
+
+
+def _build_codex_command(request: JobLaunchRequest) -> str:
+    prompt_expr = '\\"\\$(cat \\"$PROMPT_FILE\\")\\"'
+    if request.resume_session_id:
+        session_id = shlex.quote(request.resume_session_id)
+        return f"codex --no-alt-screen resume {session_id} {prompt_expr}"
+    return f"codex --no-alt-screen {prompt_expr}"

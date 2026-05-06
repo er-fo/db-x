@@ -91,6 +91,48 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["instance_id"], "i-123")
         self.assertEqual(payload["runtime"]["state"], "ready")
 
+    def test_start_forwards_resume_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            with patch(
+                "dbx.cli.launch_instance",
+                return_value={"Instances": [{"InstanceId": "i-123"}]},
+            ):
+                with patch(
+                    "dbx.cli._wait_for_runtime_ready",
+                    return_value={"phase": "runtime", "state": "ready"},
+                    create=True,
+                ):
+                    with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
+                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                            exit_code = cli.main(
+                                [
+                                    "--config",
+                                    str(config_path),
+                                    "start",
+                                    "--resume-session",
+                                    "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                                    "er-fo/db-x",
+                                    str(mission_path),
+                                ]
+                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(saved_jobs)
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["resume_session_id"],
+            "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+        )
+
     def test_finish_command_dispatches_to_run_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"

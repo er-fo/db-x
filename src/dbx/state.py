@@ -19,6 +19,7 @@ class JobState:
     session_name: str
     mission_path: str
     created_at: str
+    resume_session_id: str | None = None
     job_root: str = ""
     lifecycle_state: str = "created"
     status: str = "pending"
@@ -56,6 +57,7 @@ def load_job_state(instance_id: str, state_dir: Path | None = None) -> JobState 
     payload.setdefault("job_root", "")
     payload.setdefault("lifecycle_state", "created")
     payload.setdefault("status", "pending")
+    payload.setdefault("resume_session_id", None)
     payload.setdefault("pr_url", None)
     payload.setdefault("last_error", None)
     payload.setdefault("terminated_at", None)

@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 args.repo,
                 args.mission,
+                resume_session_id=args.resume_session,
                 wait=args.wait,
                 timeout_seconds=args.timeout,
             )
@@ -113,6 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser = subparsers.add_parser("start", help="Launch a new job instance.")
     start_parser.add_argument("repo", help="GitHub repo in owner/name format.")
     start_parser.add_argument("mission", help="Path to a mission markdown file.")
+    start_parser.add_argument(
+        "--resume-session",
+        help="Resume an existing Codex session UUID instead of starting a fresh one.",
+    )
     start_parser.add_argument(
         "--wait",
         dest="wait",
@@ -252,6 +257,7 @@ def run_start(
     repo: str,
     mission: str,
     *,
+    resume_session_id: str | None = None,
     wait: bool = True,
     timeout_seconds: int = 600,
 ) -> int:
@@ -275,6 +281,7 @@ def run_start(
         job_name=job_name,
         branch_name=branch_name,
         session_name=session_name,
+        resume_session_id=resume_session_id,
     )
     payload = launch_instance(config, request)
     instances = payload.get("Instances", [])
@@ -287,6 +294,7 @@ def run_start(
         session_name=session_name,
         mission_path=str(mission_path),
         created_at=created_at_now(),
+        resume_session_id=resume_session_id,
         job_root=job_root,
         lifecycle_state="launching",
         status="starting",
@@ -309,6 +317,7 @@ def run_start(
         "branch_name": branch_name,
         "session_name": session_name,
         "instance_id": instance_id,
+        "resume_session_id": resume_session_id,
     }
     if runtime is not None:
         output["runtime"] = runtime
@@ -333,6 +342,7 @@ def run_list(config: AppConfig) -> int:
                 "repo": local_state.repo if local_state else None,
                 "branch_name": local_state.branch_name if local_state else None,
                 "mission_path": local_state.mission_path if local_state else None,
+                "resume_session_id": local_state.resume_session_id if local_state else None,
                 "lifecycle_state": local_state.lifecycle_state if local_state else None,
                 "status": local_state.status if local_state else None,
                 "pr_url": local_state.pr_url if local_state else None,
@@ -526,6 +536,7 @@ def _build_status_summary(
         "repo": local_state.repo,
         "branch_name": local_state.branch_name,
         "mission_path": local_state.mission_path,
+        "resume_session_id": local_state.resume_session_id,
         "job_root": local_state.job_root,
         "lifecycle_state": local_state.lifecycle_state,
         "status": local_state.status,
