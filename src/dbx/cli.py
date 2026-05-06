@@ -20,7 +20,9 @@ from .aws import (
     terminate_instance,
 )
 from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config
+from .config import resolve_config_path, write_default_config
 from .ssh import build_attach_command
+from .state import JobState, created_at_now, load_job_state, save_job_state
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return run_doctor(args.config)
+    if args.command == "init-config":
+        return run_init_config(args.config, args.force)
 
     try:
         config = load_config(args.config)
@@ -67,6 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("doctor", help="Validate local prerequisites.")
+    init_config_parser = subparsers.add_parser(
+        "init-config", help="Write a starter config file."
+    )
+    init_config_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing config file.",
+    )
 
     start_parser = subparsers.add_parser("start", help="Launch a new job instance.")
     start_parser.add_argument("repo", help="GitHub repo in owner/name format.")
@@ -89,16 +101,46 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_doctor(config_path: str | None) -> int:
-    missing = [tool for tool in ["aws", "gh", "git", "ssh", "tmux", "python3"] if shutil.which(tool) is None]
+    tools = {
+        tool: shutil.which(tool) is not None
+        for tool in ["aws", "gh", "git", "ssh", "tmux", "python3", "tailscale", "codex"]
+    }
+    missing = [tool for tool in ["aws", "git", "ssh", "tmux", "python3"] if not tools[tool]]
+    config_ok = False
+    config_error = None
+    aws_identity = None
+    aws_error = None
+    if not missing:
+        try:
+            config = load_config(config_path)
+            config_ok = True
+            aws_identity = _aws_identity(config)
+        except (FileNotFoundError, ValueError) as exc:
+            config_error = str(exc)
+        except AwsCliError as exc:
+            config_ok = True
+            aws_error = str(exc)
     report = {
         "config_path": str(Path(config_path).expanduser()) if config_path else str(DEFAULT_CONFIG_PATH),
-        "tools": {
-            tool: shutil.which(tool) is not None
-            for tool in ["aws", "gh", "git", "ssh", "tmux", "python3", "tailscale", "codex"]
-        },
+        "tools": tools,
+        "config_ok": config_ok,
+        "config_error": config_error,
+        "aws_identity": aws_identity,
+        "aws_error": aws_error,
     }
     print(json.dumps(report, indent=2))
-    return 0 if not missing else 1
+    return 0 if not missing and config_ok and aws_error is None else 1
+
+
+def run_init_config(config_path: str | None, force: bool) -> int:
+    target = resolve_config_path(config_path)
+    try:
+        write_default_config(target, force=force)
+    except FileExistsError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps({"config_path": str(target), "written": True}, indent=2))
+    return 0
 
 
 def run_start(config: AppConfig, repo: str, mission: str) -> int:
@@ -125,6 +167,17 @@ def run_start(config: AppConfig, repo: str, mission: str) -> int:
     payload = launch_instance(config, request)
     instances = payload.get("Instances", [])
     instance_id = instances[0]["InstanceId"] if instances else "<unknown>"
+    save_job_state(
+        JobState(
+            instance_id=instance_id,
+            job_name=job_name,
+            repo=repo,
+            branch_name=branch_name,
+            session_name=session_name,
+            mission_path=str(mission_path),
+            created_at=created_at_now(),
+        )
+    )
     output = {
         "job_name": job_name,
         "branch_name": branch_name,
@@ -139,12 +192,19 @@ def run_list(config: AppConfig) -> int:
     instances = list_instances(config)
     simplified = []
     for instance in instances:
+        instance_id = instance.get("InstanceId")
+        local_state = (
+            load_job_state(instance_id) if isinstance(instance_id, str) and instance_id else None
+        )
         simplified.append(
             {
-                "instance_id": instance.get("InstanceId"),
+                "instance_id": instance_id,
                 "state": ((instance.get("State") or {}).get("Name")),
                 "name": _find_name(instance),
                 "launch_time": instance.get("LaunchTime"),
+                "repo": local_state.repo if local_state else None,
+                "branch_name": local_state.branch_name if local_state else None,
+                "mission_path": local_state.mission_path if local_state else None,
             }
         )
     print(json.dumps(simplified, indent=2, default=str))
@@ -153,6 +213,7 @@ def run_list(config: AppConfig) -> int:
 
 def run_status(config: AppConfig, job_id: str) -> int:
     instance = describe_instance(config, job_id)
+    local_state = load_job_state(job_id)
     summary = {
         "instance_id": instance.get("InstanceId"),
         "name": _find_name(instance),
@@ -160,6 +221,9 @@ def run_status(config: AppConfig, job_id: str) -> int:
         "launch_time": instance.get("LaunchTime"),
         "private_dns_name": instance.get("PrivateDnsName"),
         "private_ip": instance.get("PrivateIpAddress"),
+        "repo": local_state.repo if local_state else None,
+        "branch_name": local_state.branch_name if local_state else None,
+        "mission_path": local_state.mission_path if local_state else None,
     }
     print(json.dumps(summary, indent=2, default=str))
     return 0
@@ -201,6 +265,35 @@ def _slugify(value: str) -> str:
 
 def shlex_quote(value: str) -> str:
     return subprocess.list2cmdline([value]) if sys.platform == "win32" else shlex.quote(value)
+
+
+def _aws_identity(config: AppConfig) -> dict[str, object]:
+    result = subprocess.run(
+        _aws_identity_command(config),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AwsCliError(result.stderr.strip() or "Could not query AWS caller identity.")
+    return json.loads(result.stdout)
+
+
+def _aws_identity_command(config: AppConfig) -> list[str]:
+    command = ["aws"]
+    if config.aws_profile:
+        command.extend(["--profile", config.aws_profile])
+    command.extend(
+        [
+            "--region",
+            config.aws_region,
+            "sts",
+            "get-caller-identity",
+            "--output",
+            "json",
+        ]
+    )
+    return command
 
 
 if __name__ == "__main__":

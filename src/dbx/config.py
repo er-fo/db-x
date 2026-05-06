@@ -7,6 +7,19 @@ import tomllib
 
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "db-x" / "config.toml"
+DEFAULT_CONFIG_TEMPLATE = """aws_profile = "personal"
+aws_region = "eu-north-1"
+default_owner = "er-fo"
+default_base_branch = "main"
+ami_id = "ami-xxxxxxxxxxxxxxxxx"
+subnet_id = "subnet-xxxxxxxxxxxxxxxxx"
+security_group_id = "sg-xxxxxxxxxxxxxxxxx"
+instance_type = "c7i.xlarge"
+ssh_user = "ubuntu"
+tailscale_domain = "tail12345.ts.net"
+repo_root = "/home/ubuntu/work"
+job_prefix = "dbx"
+"""
 
 
 @dataclass(frozen=True)
@@ -62,6 +75,14 @@ def load_config(explicit_path: str | None = None) -> AppConfig:
         repo_root=_required_str(data, "repo_root"),
         job_prefix=_required_str(data, "job_prefix"),
     )
+
+
+def write_default_config(path: Path, *, force: bool = False) -> None:
+    target = path.expanduser()
+    if target.exists() and not force:
+        raise FileExistsError(f"Refusing to overwrite existing config at {target}.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8")
 
 
 def _required_str(data: dict[str, object], key: str) -> str:

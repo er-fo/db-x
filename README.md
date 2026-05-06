@@ -10,10 +10,11 @@ a real devbox without leaving compute running between jobs.
 ## What it does
 
 - Starts a new EC2 job instance from a prebuilt AMI
-- Injects a mission file as cloud-init user data
+- Injects a mission file and bootstrap prompt as cloud-init user data
 - Uses Tailscale + SSH for private access
 - Keeps Codex running in `tmux`
-- Provides local commands to launch, inspect, attach, and terminate jobs
+- Clones the repo, creates a branch, and starts Codex on-instance
+- Keeps local job metadata so `list` and `status` stay informative
 
 ## What it does not do yet
 
@@ -25,6 +26,7 @@ a real devbox without leaving compute running between jobs.
 ## Command surface
 
 ```bash
+dbx init-config
 dbx doctor
 dbx start er-fo/db-x missions/bootstrap.md
 dbx list
@@ -33,9 +35,23 @@ dbx attach i-0123456789abcdef0
 dbx terminate i-0123456789abcdef0
 ```
 
+`dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
+
 ## Config
 
 `db-x` reads configuration from `~/.config/db-x/config.toml` by default.
+
+Create it with:
+
+```bash
+PYTHONPATH=src python3.11 -m dbx init-config
+```
+
+When you pass a custom config path, put `--config` before the subcommand:
+
+```bash
+PYTHONPATH=src python3.11 -m dbx --config ~/.config/db-x/config.toml doctor
+```
 
 Example:
 
