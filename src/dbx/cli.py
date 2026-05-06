@@ -400,20 +400,14 @@ def _upload_resume_session_when_reachable(
     deadline = time.time() + timeout_seconds
     remote_path = _remote_codex_session_path(config, relative_path)
     content = session_file.read_text(encoding="utf-8")
-    last_problem = "waiting for instance to run"
+    target = f"{config.ssh_user}@{job_state.session_name}"
+    last_problem = "waiting for SSH upload target"
 
     while time.time() < deadline:
-        instance = describe_instance(config, job_state.instance_id)
-        instance_state = ((instance.get("State") or {}).get("Name"))
-        if instance_state != "running":
-            last_problem = f"instance state is {instance_state}"
-            time.sleep(poll_interval_seconds)
-            continue
         try:
-            target = build_ssh_target(config, instance)
             upload_remote_text(target, remote_path, content)
             return {"remote_path": remote_path, "uploaded": True}
-        except (AwsCliError, RemoteCommandError) as exc:
+        except RemoteCommandError as exc:
             last_problem = str(exc)
             time.sleep(poll_interval_seconds)
 

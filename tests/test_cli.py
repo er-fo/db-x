@@ -184,6 +184,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("Codex session not found locally", stderr.getvalue())
 
+    def test_resume_session_upload_uses_job_hostname_without_aws_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = cli.load_config(_write_sample_config(tmpdir))
+            session_file = Path(tmpdir) / "session.jsonl"
+            session_file.write_text("{\"type\":\"session\"}\n", encoding="utf-8")
+            with patch("dbx.cli.describe_instance", side_effect=AssertionError("no aws poll")):
+                with patch("dbx.cli.time.sleep"):
+                    with patch(
+                        "dbx.cli.upload_remote_text",
+                        side_effect=[cli.RemoteCommandError("not ready"), None],
+                    ) as upload:
+                        result = cli._upload_resume_session_when_reachable(
+                            config,
+                            _sample_job_state(),
+                            session_file,
+                            "2026/05/06/session.jsonl",
+                            timeout_seconds=30,
+                        )
+
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(upload.call_args.args[0], "ubuntu@dbx-job")
+        self.assertEqual(
+            upload.call_args.args[1],
+            "/home/ubuntu/.codex/sessions/2026/05/06/session.jsonl",
+        )
+
     def test_finish_command_dispatches_to_run_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
@@ -439,6 +465,12 @@ ssh_user = "ubuntu"
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 """
+
+
+def _write_sample_config(tmpdir: str) -> str:
+    config_path = Path(tmpdir) / "config.toml"
+    config_path.write_text(_sample_config(), encoding="utf-8")
+    return str(config_path)
 
 
 def _sample_job_state() -> JobState:
