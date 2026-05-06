@@ -169,9 +169,11 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "  tailscale up \"${TAILSCALE_UP_ARGS[@]}\"",
         "fi",
         "write_status \"bootstrap\" \"running\" \"starting tmux codex session\"",
-        "sudo -u \"$DBX_USER\" -H tmux new-session -d -s \"$SESSION_NAME\" "
-        f"\"cd '$REPO_DIR' && {codex_command} "
-        "2>&1 | tee '$LOG_FILE'; exec bash\"",
+        "sudo -u \"$DBX_USER\" -H tmux new-session -d -s \"$SESSION_NAME\" -c \"$REPO_DIR\"",
+        "sudo -u \"$DBX_USER\" -H tmux pipe-pane -o -t \"$SESSION_NAME\":0.0 \"cat >> '$LOG_FILE'\"",
+        "sudo -u \"$DBX_USER\" -H tmux send-keys -t \"$SESSION_NAME\":0.0 "
+        + shlex.quote(codex_command)
+        + " C-m",
         "write_status \"runtime\" \"ready\" \"tmux session started\"",
     ]
     return "\n".join(script)

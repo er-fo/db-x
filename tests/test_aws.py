@@ -63,6 +63,8 @@ class AwsTests(unittest.TestCase):
         self.assertIn("gh auth setup-git", script)
         self.assertIn("sudo -u \"$DBX_USER\" -H git clone", script)
         self.assertIn("sudo -u \"$DBX_USER\" -H tmux new-session", script)
+        self.assertIn("tmux pipe-pane -o", script)
+        self.assertNotIn("| tee '$LOG_FILE'", script)
 
     def test_build_user_data_is_valid_bash(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
