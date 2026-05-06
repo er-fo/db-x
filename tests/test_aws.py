@@ -62,6 +62,8 @@ class AwsTests(unittest.TestCase):
         self.assertIn("--hostname \"$SESSION_NAME\"", script)
         self.assertIn("gh auth setup-git", script)
         self.assertIn("sudo -u \"$DBX_USER\" -H git clone", script)
+        self.assertIn("[projects.", script)
+        self.assertIn("trust_level = \"trusted\"", script)
         self.assertIn("sudo -u \"$DBX_USER\" -H tmux new-session", script)
         self.assertIn("tmux pipe-pane -o", script)
         self.assertNotIn("| tee '$LOG_FILE'", script)
@@ -112,13 +114,14 @@ class AwsTests(unittest.TestCase):
             script = build_user_data(config, request)
 
         self.assertIn(
-            'codex --no-alt-screen resume 019dfdac-5bea-71f0-91c5-4fdd8826860b',
+            'codex --no-alt-screen --ask-for-approval never --sandbox danger-full-access resume 019dfdac-5bea-71f0-91c5-4fdd8826860b',
             script,
         )
         self.assertIn(
-            '"$(cat "$PROMPT_FILE")"',
+            '"$(cat /home/ubuntu/work/dbx-ship-123/BOOTSTRAP_PROMPT.txt)"',
             script,
         )
+        self.assertNotIn('"$(cat "$PROMPT_FILE")"', script)
 
 
 def _sample_config() -> str:

@@ -66,7 +66,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     bootstrap_log = f"{log_dir}/bootstrap.log"
     log_file = f"{log_dir}/codex.log"
     finish_log = f"{log_dir}/finish.log"
-    codex_command = _build_codex_command(request)
+    codex_command = _build_codex_command(request, prompt_file)
     tailscale_tags = ",".join(config.tailscale_tags)
 
     script = [
@@ -159,6 +159,20 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "  sudo -u \"$DBX_USER\" -H git clone \"$REPO_CLONE_URL\" \"$REPO_DIR\"",
         "fi",
         "sudo -u \"$DBX_USER\" -H env REPO_DIR=\"$REPO_DIR\" BRANCH_NAME=\"$BRANCH_NAME\" BASE_BRANCH=\"$BASE_BRANCH\" MISSION_FILE=\"$MISSION_FILE\" bash -lc 'cd \"$REPO_DIR\" && git fetch origin --prune && git checkout -B \"$BRANCH_NAME\" \"origin/$BASE_BRANCH\" && cp \"$MISSION_FILE\" \"$REPO_DIR/AGENT_MISSION.md\"'",
+        "sudo -u \"$DBX_USER\" -H env REPO_DIR=\"$REPO_DIR\" python3 - <<'PY'",
+        "import json",
+        "import os",
+        "from pathlib import Path",
+        "",
+        "repo_dir = os.environ['REPO_DIR']",
+        "config_path = Path.home() / '.codex' / 'config.toml'",
+        "config_path.parent.mkdir(parents=True, exist_ok=True)",
+        "existing = config_path.read_text(encoding='utf-8') if config_path.exists() else ''",
+        "entry = '\\n[projects.' + json.dumps(repo_dir) + ']\\ntrust_level = \"trusted\"\\n'",
+        "if entry not in existing:",
+        "    with config_path.open('a', encoding='utf-8') as handle:",
+        "        handle.write(entry)",
+        "PY",
         "if [ -n \"$TAILSCALE_AUTH_KEY\" ]; then",
         "  write_status \"bootstrap\" \"running\" \"connecting tailscale\"",
         "  systemctl start tailscaled",
@@ -373,9 +387,10 @@ def _build_bootstrap_prompt() -> str:
     )
 
 
-def _build_codex_command(request: JobLaunchRequest) -> str:
-    prompt_expr = '"$(cat "$PROMPT_FILE")"'
+def _build_codex_command(request: JobLaunchRequest, prompt_file: str) -> str:
+    prompt_expr = f'"$(cat {shlex.quote(prompt_file)})"'
+    codex = "codex --no-alt-screen --ask-for-approval never --sandbox danger-full-access"
     if request.resume_session_id:
         session_id = shlex.quote(request.resume_session_id)
-        return f"codex --no-alt-screen resume {session_id} {prompt_expr}"
-    return f"codex --no-alt-screen {prompt_expr}"
+        return f"{codex} resume {session_id} {prompt_expr}"
+    return f"{codex} {prompt_expr}"

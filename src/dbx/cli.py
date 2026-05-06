@@ -758,7 +758,13 @@ def _remote_paths(job_state: JobState) -> dict[str, str]:
 
 def _read_remote_json(target: str, path: str) -> dict[str, object]:
     output = _read_remote_command_output(target, f"cat {shlex.quote(path)}")
-    payload = json.loads(output)
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        excerpt = output[:200].replace("\n", "\\n")
+        raise RemoteCommandError(
+            f"Remote JSON artifact was invalid at {path}: {excerpt}"
+        ) from exc
     return payload if isinstance(payload, dict) else {}
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -310,6 +311,69 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(saved_jobs[-1].status, "terminated")
         self.assertEqual(saved_jobs[-1].lifecycle_state, "terminated")
+
+    def test_terminate_continues_when_remote_artifact_capture_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli._load_or_infer_job_state",
+                    return_value=_sample_job_state(),
+                ):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch(
+                            "dbx.cli._capture_remote_artifacts",
+                            side_effect=cli.RemoteCommandError("bad remote json"),
+                        ):
+                            with patch(
+                                "dbx.cli._console_output_excerpt",
+                                return_value="console failure",
+                            ):
+                                with patch("dbx.cli.save_job_artifact") as save_artifact:
+                                    with patch(
+                                        "dbx.cli.terminate_instance",
+                                        return_value={
+                                            "TerminatingInstances": [{"InstanceId": "i-123"}]
+                                        },
+                                    ) as terminate_instance:
+                                        with patch(
+                                            "dbx.cli.wait_for_instance_terminated",
+                                            return_value={"State": {"Name": "terminated"}},
+                                        ):
+                                            with patch("sys.stdout", new=io.StringIO()):
+                                                exit_code = cli.main(
+                                                    [
+                                                        "--config",
+                                                        str(config_path),
+                                                        "terminate",
+                                                        "i-123",
+                                                    ]
+                                                )
+
+        self.assertEqual(exit_code, 0)
+        terminate_instance.assert_called_once()
+        save_artifact.assert_called_once()
+
+    def test_read_remote_json_reports_invalid_payload_as_remote_error(self) -> None:
+        with patch(
+            "dbx.cli.run_remote_shell_command",
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="not-json",
+                stderr="",
+            ),
+        ):
+            with self.assertRaises(cli.RemoteCommandError):
+                cli._read_remote_json("ubuntu@dbx-job", "/tmp/status.json")
 
 
 def _sample_config() -> str:

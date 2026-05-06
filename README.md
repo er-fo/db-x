@@ -11,7 +11,7 @@ a real devbox without leaving compute running between jobs.
 
 - Starts a new EC2 job instance from a prebuilt AMI
 - Injects a mission file and bootstrap prompt as cloud-init user data
-- Uses Tailscale + `tailscale ssh` for private access
+- Uses ordinary SSH over the Tailscale network for private access
 - Keeps Codex running in `tmux`
 - Clones the repo, creates a branch, and starts Codex on-instance
 - Keeps local job metadata so `list` and `status` stay informative
@@ -72,9 +72,10 @@ repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 ```
 
-For unattended access to disposable devboxes, configure your tailnet policy so the
-chosen device tag (for example `tag:dbx`) has an SSH rule with `action: "accept"`
-for the operator and target user such as `ubuntu`.
+For unattended access to disposable devboxes, use a tagged, ephemeral Tailscale
+auth key. The AMI must also contain working SSH authorization for the operator,
+because `dbx` uses OpenSSH over the private Tailscale address rather than the
+`tailscale ssh` wrapper.
 
 ## Security model
 

@@ -8,13 +8,23 @@ class RemoteCommandError(RuntimeError):
     pass
 
 
+SSH_OPTIONS = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "ConnectTimeout=20",
+]
+
+
 def build_attach_command(target: str, session_name: str) -> list[str]:
-    return ["tailscale", "ssh", target, "tmux", "attach", "-t", session_name]
+    return ["ssh", *SSH_OPTIONS, target, "tmux", "attach", "-t", session_name]
 
 
 def run_ssh_command(target: str, remote_command: str) -> int:
     result = subprocess.run(
-        ["tailscale", "ssh", target, "bash", "-lc", remote_command],
+        ["ssh", *SSH_OPTIONS, target, "bash", "-lc", remote_command],
         check=False,
     )
     return result.returncode
@@ -28,8 +38,8 @@ def run_remote_shell_command(
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     command = [
-        "tailscale",
         "ssh",
+        *SSH_OPTIONS,
         target,
         "bash",
         "-lc",

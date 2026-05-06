@@ -13,8 +13,13 @@ class SshTests(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "tailscale",
                 "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=20",
                 "ubuntu@dbx-job.tail.ts.net",
                 "tmux",
                 "attach",
@@ -36,8 +41,13 @@ class SshTests(unittest.TestCase):
         self.assertEqual(result.stdout, "ok")
         run.assert_called_once_with(
             [
-                "tailscale",
                 "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=20",
                 "ubuntu@dbx-job.tail.ts.net",
                 "bash",
                 "-lc",
