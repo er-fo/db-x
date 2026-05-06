@@ -166,8 +166,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     start_parser = subparsers.add_parser("start", help="Launch a new job instance.")
-    start_parser.add_argument("repo", help="GitHub repo in owner/name format.")
-    start_parser.add_argument("mission", help="Path to a mission markdown file.")
+    start_parser.add_argument(
+        "repo",
+        nargs="?",
+        help="GitHub repo in owner/name format. Defaults to config default_repo.",
+    )
+    start_parser.add_argument(
+        "mission",
+        nargs="?",
+        help="Path to a mission markdown file. Defaults to config default_mission.",
+    )
     start_parser.add_argument(
         "--resume-session",
         nargs="?",
@@ -323,16 +331,37 @@ def run_sessions(limit: int | None = None, *, json_output: bool = False) -> int:
     return 0
 
 
+def _resolve_start_inputs(
+    config: AppConfig,
+    repo: str | None,
+    mission: str | None,
+) -> tuple[str | None, str | None]:
+    resolved_repo = repo or config.default_repo
+    resolved_mission = mission or config.default_mission
+    return resolved_repo, resolved_mission
+
+
 def run_start(
     config: AppConfig,
-    repo: str,
-    mission: str,
+    repo: str | None,
+    mission: str | None,
     *,
     resume_session_id: str | None = None,
     pick_session: bool = False,
     wait: bool = True,
     timeout_seconds: int = 600,
 ) -> int:
+    should_auto_pick = repo is None and mission is None and resume_session_id is None and not pick_session
+    repo, mission = _resolve_start_inputs(config, repo, mission)
+    if repo is None or mission is None:
+        print(
+            "Config default_repo and default_mission are required when running "
+            "'dbx start' without explicit repo and mission.",
+            file=sys.stderr,
+        )
+        return 2
+    if should_auto_pick:
+        pick_session = True
     mission_path = Path(mission).expanduser().resolve()
     if not mission_path.exists():
         print(f"Mission file not found: {mission_path}", file=sys.stderr)

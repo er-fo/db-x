@@ -410,6 +410,75 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["instance_id"], "i-123")
         self.assertEqual(payload["runtime"]["state"], "ready")
 
+    def test_start_uses_configured_defaults_and_opens_picker_when_no_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="resume default launch",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            saved_jobs = []
+            stdin = _TTYInput("\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ) as launch_instance:
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                            exit_code = cli.main(
+                                                ["--config", str(config_path), "start"]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Use ↑/↓", stderr.getvalue())
+        self.assertEqual(saved_jobs[-1].repo, "er-fo/db-x")
+        self.assertEqual(saved_jobs[-1].mission_path, str(mission_path.resolve()))
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+        request = launch_instance.call_args.args[1]
+        self.assertEqual(request.repo, "er-fo/db-x")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["instance_id"], "i-123")
+
+    def test_start_without_args_requires_configured_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            with patch("sys.stderr", new=io.StringIO()) as stderr:
+                exit_code = cli.main(["--config", str(config_path), "start"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("default_repo", stderr.getvalue())
+        self.assertIn("default_mission", stderr.getvalue())
+
     def test_start_forwards_resume_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"

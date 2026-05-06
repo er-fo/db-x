@@ -31,6 +31,7 @@ a real devbox without leaving compute running between jobs.
 dbx init-config
 dbx doctor
 dbx sessions
+dbx start
 dbx start er-fo/db-x missions/bootstrap.md
 dbx start er-fo/db-x missions/bootstrap.md --pick-session
 dbx list
@@ -42,13 +43,14 @@ dbx finish i-0123456789abcdef0
 dbx terminate i-0123456789abcdef0
 ```
 
-Use `dbx sessions` to inspect the latest local Codex sessions before launching.
-It prints a simple 10-row table with created time, updated time, branch, full
-session path, and latest user message. Use `--pick-session` when you want
-`dbx start` to show an arrow-key picker over the same table. The picker also
-accepts a pasted session ID or path. Subagent sessions are excluded, so the list
-shows direct user-submitted conversations. `--resume-session <session-id>`
-remains available for scripted launches.
+Use `dbx start` for the normal interactive flow. It uses `default_repo` and
+`default_mission` from the config, opens an arrow-key picker over the latest
+local Codex sessions, and resumes the selected conversation. `dbx sessions`
+prints the same simple 10-row table with created time, updated time, branch,
+full session path, and latest user message. The picker also accepts a pasted
+session ID or path. Subagent sessions are excluded, so the list shows direct
+user-submitted conversations. `dbx start <repo> <mission>` and
+`--resume-session <session-id>` remain available for scripted launches.
 
 `dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
 
@@ -74,6 +76,8 @@ Example:
 aws_profile = "personal"
 aws_region = "eu-north-1"
 default_owner = "er-fo"
+default_repo = "er-fo/db-x"
+default_mission = "missions/bootstrap.md"
 default_base_branch = "main"
 ami_id = "ami-xxxxxxxxxxxxxxxxx"
 subnet_id = "subnet-xxxxxxxxxxxxxxxxx"
