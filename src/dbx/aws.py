@@ -32,6 +32,7 @@ def run_aws_cli(
     *,
     check: bool = True,
     capture_output: bool = True,
+    timeout_seconds: int = 60,
 ) -> subprocess.CompletedProcess[str]:
     command = ["aws"]
     if config.aws_profile:
@@ -39,12 +40,18 @@ def run_aws_cli(
     command.extend(["--region", config.aws_region])
     command.extend(args)
 
-    result = subprocess.run(
-        command,
-        check=False,
-        capture_output=capture_output,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=capture_output,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AwsCliError(
+            f"AWS CLI command timed out after {timeout_seconds}s: {' '.join(command)}"
+        ) from exc
     if check and result.returncode != 0:
         raise AwsCliError(result.stderr.strip() or "AWS CLI command failed.")
     return result

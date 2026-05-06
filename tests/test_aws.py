@@ -5,12 +5,27 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from dbx.aws import JobLaunchRequest, build_ssh_target, build_user_data
+from dbx.aws import AwsCliError, JobLaunchRequest, build_ssh_target, build_user_data
+from dbx.aws import run_aws_cli
 from dbx.config import load_config
 
 
 class AwsTests(unittest.TestCase):
+    def test_run_aws_cli_reports_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            config = load_config(str(config_path))
+
+        with patch(
+            "dbx.aws.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["aws"], timeout=60),
+        ):
+            with self.assertRaises(AwsCliError):
+                run_aws_cli(config, ["sts", "get-caller-identity"])
+
     def test_build_ssh_target_keeps_tailscale_hostname_short(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
