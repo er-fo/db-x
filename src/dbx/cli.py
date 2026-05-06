@@ -536,13 +536,6 @@ def _wait_for_runtime_ready(
             continue
 
         status = describe_instance_status(config, job_state.instance_id) or {}
-        system_ok = ((status.get("SystemStatus") or {}).get("Status")) == "ok"
-        instance_ok = ((status.get("InstanceStatus") or {}).get("Status")) == "ok"
-        if not (system_ok and instance_ok):
-            last_problem = "EC2 status checks are not yet passing"
-            time.sleep(poll_interval_seconds)
-            continue
-
         target = build_ssh_target(config, instance)
         try:
             if not _remote_file_exists(target, "/var/lib/cloud/instance/boot-finished"):

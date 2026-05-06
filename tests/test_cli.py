@@ -319,6 +319,45 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["remote_status"]["state"], "ready")
         self.assertEqual(payload["logs"]["codex"], "codex\n")
 
+    def test_wait_for_runtime_ready_reports_but_does_not_block_on_ec2_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = cli.load_config(_write_sample_config(tmpdir))
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli.describe_instance_status",
+                    return_value={
+                        "SystemStatus": {"Status": "initializing"},
+                        "InstanceStatus": {"Status": "initializing"},
+                    },
+                ):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch("dbx.cli._remote_file_exists", return_value=True):
+                            with patch(
+                                "dbx.cli._read_remote_json",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._remote_tmux_session_exists",
+                                    return_value=True,
+                                ):
+                                    runtime = cli._wait_for_runtime_ready(
+                                        config,
+                                        _sample_job_state(),
+                                        timeout_seconds=1,
+                                        poll_interval_seconds=0,
+                                    )
+
+        self.assertEqual(runtime["state"], "ready")
+        self.assertEqual(runtime["system_status"], "initializing")
+        self.assertEqual(runtime["instance_status"], "initializing")
+
     def test_attach_check_reports_ready_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
