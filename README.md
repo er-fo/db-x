@@ -11,10 +11,12 @@ a real devbox without leaving compute running between jobs.
 
 - Starts a new EC2 job instance from a prebuilt AMI
 - Injects a mission file and bootstrap prompt as cloud-init user data
-- Uses Tailscale + SSH for private access
+- Uses ordinary SSH over the Tailscale network for private access
 - Keeps Codex running in `tmux`
 - Clones the repo, creates a branch, and starts Codex on-instance
 - Keeps local job metadata so `list` and `status` stay informative
+- Preserves remote work, pushes the job branch, opens a PR, and terminates the
+  instance with `finish`
 
 ## What it does not do yet
 
@@ -29,9 +31,13 @@ a real devbox without leaving compute running between jobs.
 dbx init-config
 dbx doctor
 dbx start er-fo/db-x missions/bootstrap.md
+dbx start er-fo/db-x missions/bootstrap.md --resume-session 00000000-0000-0000-0000-000000000000
 dbx list
 dbx status i-0123456789abcdef0
+dbx status i-0123456789abcdef0 --logs
 dbx attach i-0123456789abcdef0
+dbx attach i-0123456789abcdef0 --check
+dbx finish i-0123456789abcdef0
 dbx terminate i-0123456789abcdef0
 ```
 
@@ -44,13 +50,13 @@ dbx terminate i-0123456789abcdef0
 Create it with:
 
 ```bash
-PYTHONPATH=src python3.11 -m dbx init-config
+dbx init-config
 ```
 
 When you pass a custom config path, put `--config` before the subcommand:
 
 ```bash
-PYTHONPATH=src python3.11 -m dbx --config ~/.config/db-x/config.toml doctor
+dbx --config ~/.config/db-x/config.toml doctor
 ```
 
 Example:
@@ -66,9 +72,16 @@ security_group_id = "sg-xxxxxxxxxxxxxxxxx"
 instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_domain = "tail12345.ts.net"
+tailscale_auth_key = "tskey-auth-xxxxxxxx"
+tailscale_tags = ["tag:dbx"]
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
 ```
+
+For unattended access to disposable devboxes, use a tagged, ephemeral Tailscale
+auth key. The AMI must also contain working SSH authorization for the operator,
+because `dbx` uses OpenSSH over the private Tailscale address rather than the
+`tailscale ssh` wrapper.
 
 ## Security model
 
