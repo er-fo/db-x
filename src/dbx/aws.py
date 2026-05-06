@@ -371,8 +371,6 @@ def build_ssh_target(config: AppConfig, instance: dict[str, object]) -> str:
     hostname = _find_tag(instance, "Name") or instance.get("PrivateDnsName")
     if not isinstance(hostname, str) or not hostname:
         raise AwsCliError("Could not determine an SSH hostname for the instance.")
-    if config.tailscale_domain and "." not in hostname:
-        hostname = f"{hostname}.{config.tailscale_domain}"
     return f"{config.ssh_user}@{hostname}"
 
 

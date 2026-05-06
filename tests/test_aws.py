@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
-from dbx.aws import JobLaunchRequest, build_user_data
+from dbx.aws import JobLaunchRequest, build_ssh_target, build_user_data
 from dbx.config import load_config
 
 
 class AwsTests(unittest.TestCase):
+    def test_build_ssh_target_keeps_tailscale_hostname_short(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            config = load_config(str(config_path))
+            config = replace(config, tailscale_domain="tail123.ts.net")
+
+        target = build_ssh_target(
+            config,
+            {"Tags": [{"Key": "Name", "Value": "dbx-job"}]},
+        )
+
+        self.assertEqual(target, "ubuntu@dbx-job")
+
     def test_build_user_data_contains_clone_and_tmux_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
