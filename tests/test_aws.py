@@ -109,6 +109,10 @@ class AwsTests(unittest.TestCase):
                 branch_name="agent/ship-123",
                 session_name="dbx-ship-123",
                 resume_session_id="019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                resume_session_relative_path=(
+                    "2026/05/06/rollout-2026-05-06T16-23-44-"
+                    "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+                ),
             )
 
             script = build_user_data(config, request)
@@ -122,6 +126,11 @@ class AwsTests(unittest.TestCase):
             script,
         )
         self.assertNotIn('"$(cat "$PROMPT_FILE")"', script)
+        self.assertIn(
+            "RESUME_SESSION_REMOTE_PATH=/home/ubuntu/.codex/sessions/2026/05/06/rollout-2026-05-06T16-23-44-019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl",
+            script,
+        )
+        self.assertIn("waiting for codex resume session upload", script)
 
 
 def _sample_config() -> str:

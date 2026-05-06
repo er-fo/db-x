@@ -4,7 +4,12 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from dbx.ssh import RemoteCommandError, build_attach_command, run_remote_shell_command
+from dbx.ssh import (
+    RemoteCommandError,
+    build_attach_command,
+    run_remote_shell_command,
+    upload_remote_text,
+)
 
 
 class SshTests(unittest.TestCase):
@@ -70,6 +75,37 @@ class SshTests(unittest.TestCase):
         ):
             with self.assertRaises(RemoteCommandError):
                 run_remote_shell_command("ubuntu@dbx-job.tail.ts.net", "false")
+
+    def test_upload_remote_text_creates_parent_and_streams_content(self) -> None:
+        with patch(
+            "dbx.ssh.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ) as run:
+            upload_remote_text(
+                "ubuntu@dbx-job.tail.ts.net",
+                "/home/ubuntu/.codex/sessions/2026/05/06/session.jsonl",
+                "{\"type\":\"session\"}\n",
+            )
+
+        run.assert_called_once_with(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=20",
+                "ubuntu@dbx-job.tail.ts.net",
+                "bash",
+                "-lc",
+                "mkdir -p /home/ubuntu/.codex/sessions/2026/05/06 && cat > /home/ubuntu/.codex/sessions/2026/05/06/session.jsonl",
+            ],
+            check=False,
+            capture_output=True,
+            input="{\"type\":\"session\"}\n",
+            text=True,
+        )
 
 
 if __name__ == "__main__":

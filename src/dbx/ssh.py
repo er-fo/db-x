@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import posixpath
 import shlex
 import subprocess
 
@@ -54,3 +55,24 @@ def run_remote_shell_command(
     if check and result.returncode != 0:
         raise RemoteCommandError(result.stderr.strip() or "Remote SSH command failed.")
     return result
+
+
+def upload_remote_text(target: str, remote_path: str, content: str) -> None:
+    remote_dir = posixpath.dirname(remote_path)
+    command = [
+        "ssh",
+        *SSH_OPTIONS,
+        target,
+        "bash",
+        "-lc",
+        f"mkdir -p {shlex.quote(remote_dir)} && cat > {shlex.quote(remote_path)}",
+    ]
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        input=content,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RemoteCommandError(result.stderr.strip() or "Remote upload failed.")

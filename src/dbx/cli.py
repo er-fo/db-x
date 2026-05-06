@@ -27,6 +27,7 @@ from .aws import (
 from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config
 from .config import resolve_config_path, write_default_config
 from .ssh import RemoteCommandError, build_attach_command, run_remote_shell_command
+from .ssh import upload_remote_text
 from .state import (
     JobState,
     created_at_now,
@@ -274,6 +275,14 @@ def run_start(
     branch_name = f"agent/{slug}-{timestamp}"
     session_name = job_name
     job_root = _job_root(config, job_name)
+    resume_session_file = None
+    resume_session_relative_path = None
+    if resume_session_id:
+        resume_session_file = _find_codex_session_file(resume_session_id)
+        if resume_session_file is None:
+            print(f"Codex session not found locally: {resume_session_id}", file=sys.stderr)
+            return 2
+        resume_session_relative_path = _codex_session_relative_path(resume_session_file)
 
     request = JobLaunchRequest(
         repo=repo,
@@ -282,6 +291,7 @@ def run_start(
         branch_name=branch_name,
         session_name=session_name,
         resume_session_id=resume_session_id,
+        resume_session_relative_path=resume_session_relative_path,
     )
     payload = launch_instance(config, request)
     instances = payload.get("Instances", [])
@@ -300,6 +310,15 @@ def run_start(
         status="starting",
     )
     save_job_state(job_state)
+    resume_session_upload = None
+    if resume_session_file and resume_session_relative_path:
+        resume_session_upload = _upload_resume_session_when_reachable(
+            config,
+            job_state,
+            resume_session_file,
+            resume_session_relative_path,
+            timeout_seconds=timeout_seconds,
+        )
 
     runtime = None
     if wait:
@@ -319,6 +338,8 @@ def run_start(
         "instance_id": instance_id,
         "resume_session_id": resume_session_id,
     }
+    if resume_session_upload is not None:
+        output["resume_session_upload"] = resume_session_upload
     if runtime is not None:
         output["runtime"] = runtime
     print(json.dumps(output, indent=2))
@@ -350,6 +371,61 @@ def run_list(config: AppConfig) -> int:
         )
     print(json.dumps(simplified, indent=2, default=str))
     return 0
+
+
+def _find_codex_session_file(session_id: str) -> Path | None:
+    root = Path.home() / ".codex" / "sessions"
+    if not root.exists():
+        return None
+    matches = list(root.rglob(f"*{session_id}.jsonl"))
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _codex_session_relative_path(session_file: Path) -> str:
+    root = Path.home() / ".codex" / "sessions"
+    return session_file.expanduser().resolve().relative_to(root.expanduser().resolve()).as_posix()
+
+
+def _upload_resume_session_when_reachable(
+    config: AppConfig,
+    job_state: JobState,
+    session_file: Path,
+    relative_path: str,
+    *,
+    timeout_seconds: int,
+    poll_interval_seconds: int = 3,
+) -> dict[str, object]:
+    deadline = time.time() + timeout_seconds
+    remote_path = _remote_codex_session_path(config, relative_path)
+    content = session_file.read_text(encoding="utf-8")
+    last_problem = "waiting for instance to run"
+
+    while time.time() < deadline:
+        instance = describe_instance(config, job_state.instance_id)
+        instance_state = ((instance.get("State") or {}).get("Name"))
+        if instance_state != "running":
+            last_problem = f"instance state is {instance_state}"
+            time.sleep(poll_interval_seconds)
+            continue
+        try:
+            target = build_ssh_target(config, instance)
+            upload_remote_text(target, remote_path, content)
+            return {"remote_path": remote_path, "uploaded": True}
+        except (AwsCliError, RemoteCommandError) as exc:
+            last_problem = str(exc)
+            time.sleep(poll_interval_seconds)
+
+    raise AwsCliError(
+        f"Timed out uploading Codex resume session to {job_state.instance_id}. "
+        f"Last problem: {last_problem}"
+    )
+
+
+def _remote_codex_session_path(config: AppConfig, relative_path: str) -> str:
+    home = "/root" if config.ssh_user == "root" else f"/home/{config.ssh_user}"
+    return f"{home}/.codex/sessions/{relative_path}"
 
 
 def run_status(config: AppConfig, job_id: str, *, include_logs: bool = False) -> int:

@@ -102,25 +102,46 @@ class CliTests(unittest.TestCase):
             with patch(
                 "dbx.cli.launch_instance",
                 return_value={"Instances": [{"InstanceId": "i-123"}]},
-            ):
+            ) as launch_instance:
                 with patch(
                     "dbx.cli._wait_for_runtime_ready",
                     return_value={"phase": "runtime", "state": "ready"},
                     create=True,
                 ):
-                    with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
-                        with patch("sys.stdout", new=io.StringIO()) as stdout:
-                            exit_code = cli.main(
-                                [
-                                    "--config",
-                                    str(config_path),
-                                    "start",
-                                    "--resume-session",
-                                    "019dfdac-5bea-71f0-91c5-4fdd8826860b",
-                                    "er-fo/db-x",
-                                    str(mission_path),
-                                ]
-                            )
+                    with patch(
+                        "dbx.cli._find_codex_session_file",
+                        return_value=Path("/tmp/session.jsonl"),
+                    ):
+                        with patch(
+                            "dbx.cli._codex_session_relative_path",
+                            return_value=(
+                                "2026/05/06/rollout-2026-05-06T16-23-44-"
+                                "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+                            ),
+                        ):
+                            with patch(
+                                "dbx.cli._upload_resume_session_when_reachable",
+                                return_value={
+                                    "remote_path": (
+                                        "/home/ubuntu/.codex/sessions/2026/05/06/"
+                                        "rollout-2026-05-06T16-23-44-"
+                                        "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+                                    )
+                                },
+                            ) as upload_session:
+                                with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
+                                    with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                        exit_code = cli.main(
+                                            [
+                                                "--config",
+                                                str(config_path),
+                                                "start",
+                                                "--resume-session",
+                                                "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                                                "er-fo/db-x",
+                                                str(mission_path),
+                                            ]
+                                        )
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(saved_jobs)
@@ -133,6 +154,35 @@ class CliTests(unittest.TestCase):
             payload["resume_session_id"],
             "019dfdac-5bea-71f0-91c5-4fdd8826860b",
         )
+        request = launch_instance.call_args.args[1]
+        self.assertEqual(
+            request.resume_session_relative_path,
+            "2026/05/06/rollout-2026-05-06T16-23-44-019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl",
+        )
+        upload_session.assert_called_once()
+
+    def test_start_fails_when_requested_resume_session_is_not_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch("dbx.cli._find_codex_session_file", return_value=None):
+                with patch("sys.stderr", new=io.StringIO()) as stderr:
+                    exit_code = cli.main(
+                        [
+                            "--config",
+                            str(config_path),
+                            "start",
+                            "--resume-session",
+                            "missing-session",
+                            "er-fo/db-x",
+                            str(mission_path),
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("Codex session not found locally", stderr.getvalue())
 
     def test_finish_command_dispatches_to_run_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

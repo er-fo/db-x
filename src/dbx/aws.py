@@ -23,6 +23,7 @@ class JobLaunchRequest:
     branch_name: str
     session_name: str
     resume_session_id: str | None = None
+    resume_session_relative_path: str | None = None
 
 
 def run_aws_cli(
@@ -67,6 +68,9 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     log_file = f"{log_dir}/codex.log"
     finish_log = f"{log_dir}/finish.log"
     codex_command = _build_codex_command(request, prompt_file)
+    resume_session_remote_path = _remote_codex_session_path(
+        config, request.resume_session_relative_path
+    )
     tailscale_tags = ",".join(config.tailscale_tags)
 
     script = [
@@ -89,6 +93,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         f"BASE_BRANCH={shlex.quote(config.default_base_branch)}",
         f"TAILSCALE_AUTH_KEY={shlex.quote(config.tailscale_auth_key or '')}",
         f'TAILSCALE_TAGS={shlex.quote(tailscale_tags)}',
+        f"RESUME_SESSION_REMOTE_PATH={shlex.quote(resume_session_remote_path or '')}",
         "DBX_USER=ubuntu",
         "mkdir -p \"$JOB_ROOT\" \"$LOG_DIR\"",
         "touch \"$FINISH_LOG\"",
@@ -185,6 +190,24 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "write_status \"bootstrap\" \"running\" \"starting tmux codex session\"",
         "sudo -u \"$DBX_USER\" -H tmux new-session -d -s \"$SESSION_NAME\" -c \"$REPO_DIR\"",
         "sudo -u \"$DBX_USER\" -H tmux pipe-pane -o -t \"$SESSION_NAME\":0.0 \"cat >> '$LOG_FILE'\"",
+        "if [ -n \"$RESUME_SESSION_REMOTE_PATH\" ]; then",
+        "  write_status \"bootstrap\" \"waiting\" \"waiting for codex resume session upload\"",
+        "  for _ in $(seq 1 120); do",
+        "    if [ -f \"$RESUME_SESSION_REMOTE_PATH\" ]; then",
+        "      break",
+        "    fi",
+        "    sleep 2",
+        "  done",
+        "  if [ ! -f \"$RESUME_SESSION_REMOTE_PATH\" ]; then",
+        "    write_status \"bootstrap\" \"blocked\" \"codex resume session upload missing\"",
+        "    cat >\"$BLOCKER_FILE\" <<EOF",
+        "# Resume session upload missing",
+        "",
+        "The requested Codex resume session was not uploaded before bootstrap timed out.",
+        "EOF",
+        "    exit 0",
+        "  fi",
+        "fi",
         "sudo -u \"$DBX_USER\" -H tmux send-keys -t \"$SESSION_NAME\":0.0 "
         + shlex.quote(codex_command)
         + " C-m",
@@ -351,6 +374,13 @@ def build_ssh_target(config: AppConfig, instance: dict[str, object]) -> str:
     if config.tailscale_domain and "." not in hostname:
         hostname = f"{hostname}.{config.tailscale_domain}"
     return f"{config.ssh_user}@{hostname}"
+
+
+def _remote_codex_session_path(config: AppConfig, relative_path: str | None) -> str | None:
+    if not relative_path:
+        return None
+    home = "/root" if config.ssh_user == "root" else f"/home/{config.ssh_user}"
+    return f"{home}/.codex/sessions/{relative_path}"
 
 
 def _find_tag(instance: dict[str, object], key: str) -> str | None:
