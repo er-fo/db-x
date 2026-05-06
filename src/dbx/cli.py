@@ -38,6 +38,7 @@ from .state import (
 
 
 PICK_SESSION = "__dbx_pick_session__"
+SESSION_LIST_LIMIT = 10
 SESSION_ID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -49,7 +50,10 @@ class CodexSession:
     session_id: str
     path: Path
     relative_path: str
-    modified_at: str
+    created_at: str
+    updated_at: str
+    branch: str
+    latest_user_message: str
     size_bytes: int
 
     def to_dict(self) -> dict[str, object]:
@@ -57,7 +61,11 @@ class CodexSession:
             "session_id": self.session_id,
             "path": str(self.path),
             "relative_path": self.relative_path,
-            "modified_at": self.modified_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "modified_at": self.updated_at,
+            "branch": self.branch,
+            "latest_user_message": self.latest_user_message,
             "size_bytes": self.size_bytes,
         }
 
@@ -71,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "init-config":
         return run_init_config(args.config, args.force)
     if args.command == "sessions":
-        return run_sessions(args.limit)
+        return run_sessions(args.limit, json_output=args.json)
 
     try:
         config = load_config(args.config)
@@ -146,7 +154,12 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "--limit",
         type=int,
-        help="Maximum number of sessions to show. Defaults to all sessions.",
+        help=f"Maximum number of sessions to show, capped at {SESSION_LIST_LIMIT}.",
+    )
+    sessions_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON instead of the human table.",
     )
 
     start_parser = subparsers.add_parser("start", help="Launch a new job instance.")
@@ -298,9 +311,12 @@ def run_init_config(config_path: str | None, force: bool) -> int:
     return 0
 
 
-def run_sessions(limit: int | None = None) -> int:
-    sessions = _discover_codex_sessions(limit=limit)
-    print(json.dumps([session.to_dict() for session in sessions], indent=2))
+def run_sessions(limit: int | None = None, *, json_output: bool = False) -> int:
+    sessions = _discover_codex_sessions(limit=_session_display_limit(limit))
+    if json_output:
+        print(json.dumps([session.to_dict() for session in sessions], indent=2))
+    else:
+        print(_format_codex_sessions(sessions), end="")
     return 0
 
 
@@ -447,7 +463,7 @@ def _discover_codex_sessions(limit: int | None = None) -> list[CodexSession]:
     if not root.exists():
         return []
 
-    sessions: list[CodexSession] = []
+    candidates: list[tuple[float, Path, str, str, int]] = []
     for path in root.rglob("*.jsonl"):
         session_id = _extract_session_id(path)
         if not session_id:
@@ -457,20 +473,77 @@ def _discover_codex_sessions(limit: int | None = None) -> list[CodexSession]:
             relative_path = path.resolve().relative_to(root.resolve()).as_posix()
         except ValueError:
             relative_path = path.name
-        sessions.append(
-            CodexSession(
-                session_id=session_id,
-                path=path,
-                relative_path=relative_path,
-                modified_at=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
-                size_bytes=stat.st_size,
-            )
-        )
+        candidates.append((stat.st_mtime, path, session_id, relative_path, stat.st_size))
 
-    sessions.sort(key=lambda session: session.modified_at, reverse=True)
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
     if limit is not None:
-        return sessions[:limit]
-    return sessions
+        candidates = candidates[:limit]
+    return [
+        _load_codex_session(
+            path=path,
+            session_id=session_id,
+            relative_path=relative_path,
+            updated_at=datetime.fromtimestamp(mtime, UTC).isoformat(),
+            size_bytes=size_bytes,
+        )
+        for mtime, path, session_id, relative_path, size_bytes in candidates
+    ]
+
+
+def _session_display_limit(limit: int | None) -> int:
+    if limit is None:
+        return SESSION_LIST_LIMIT
+    return max(1, min(limit, SESSION_LIST_LIMIT))
+
+
+def _load_codex_session(
+    *,
+    path: Path,
+    session_id: str,
+    relative_path: str,
+    updated_at: str,
+    size_bytes: int,
+) -> CodexSession:
+    created_at = updated_at
+    branch = "-"
+    latest_user_message = ""
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if record.get("type") == "session_meta":
+                    created_at = _normalize_timestamp(
+                        _optional_text(payload.get("timestamp"))
+                        or _optional_text(record.get("timestamp"))
+                        or created_at
+                    )
+                    branch = _extract_branch(payload) or branch
+                if record.get("type") == "response_item" and payload.get("role") == "user":
+                    message = _extract_user_message(payload)
+                    if message:
+                        latest_user_message = message
+    except OSError:
+        pass
+
+    return CodexSession(
+        session_id=session_id,
+        path=path,
+        relative_path=relative_path,
+        created_at=created_at,
+        updated_at=updated_at,
+        branch=branch,
+        latest_user_message=latest_user_message,
+        size_bytes=size_bytes,
+    )
 
 
 def _extract_session_id(path: Path) -> str | None:
@@ -478,18 +551,111 @@ def _extract_session_id(path: Path) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def _extract_branch(payload: dict[str, object]) -> str | None:
+    git = payload.get("git")
+    if not isinstance(git, dict):
+        return None
+    for key in ("branch", "current_branch", "ref"):
+        value = git.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_user_message(payload: dict[str, object]) -> str:
+    content = payload.get("content")
+    parts: list[str] = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+    return _clean_user_message(" ".join(parts))
+
+
+def _clean_user_message(text: str) -> str:
+    cleaned = re.sub(r"<environment_context>.*?</environment_context>", " ", text, flags=re.S)
+    cleaned = re.sub(r"<turn_aborted>.*?</turn_aborted>", " ", cleaned, flags=re.S)
+    cleaned = re.sub(r"<subagent_notification>.*?</subagent_notification>", " ", cleaned, flags=re.S)
+    cleaned = re.sub(r"<image\b[^>]*>.*?</image>", " ", cleaned, flags=re.S)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _optional_text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _normalize_timestamp(value: str) -> str:
+    try:
+        return _parse_timestamp(value).isoformat()
+    except ValueError:
+        return value
+
+
+def _parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _format_codex_sessions(sessions: list[CodexSession]) -> str:
+    if not sessions:
+        return f"No local Codex sessions found under {_codex_sessions_root()}.\n"
+
+    lines = [f"{'#':<3}{'Created':<15}{'Updated':<15}{'Branch':<12}Conversation"]
+    for index, session in enumerate(sessions, start=1):
+        created = _relative_time(session.created_at)
+        updated = _relative_time(session.updated_at)
+        branch = _truncate(session.branch or "-", 11)
+        conversation = _truncate(session.latest_user_message or "(no user message)", 72)
+        lines.append(f"{index:<3}{created:<15}{updated:<15}{branch:<12}{conversation}")
+        lines.append(f"   {session.path}")
+    return "\n".join(lines) + "\n"
+
+
+def _relative_time(value: str) -> str:
+    try:
+        then = _parse_timestamp(value)
+    except ValueError:
+        return "-"
+    now = datetime.now(UTC)
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=UTC)
+    seconds = max(0, int((now - then).total_seconds()))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hours ago"
+    days = hours // 24
+    return f"{days} days ago"
+
+
+def _truncate(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."
+
+
 def _pick_codex_session() -> CodexSession:
     if not sys.stdin.isatty():
         raise ValueError("Cannot pick a Codex session without an interactive terminal.")
 
-    sessions = _discover_codex_sessions()
+    sessions = _discover_codex_sessions(limit=SESSION_LIST_LIMIT)
     if not sessions:
         raise ValueError(f"No local Codex sessions found under {_codex_sessions_root()}.")
 
     print("Local Codex sessions:", file=sys.stderr)
-    for index, session in enumerate(sessions, start=1):
-        print(f"{index}. {session.modified_at}  {session.session_id}", file=sys.stderr)
-        print(f"   {session.path}", file=sys.stderr)
+    print(_format_codex_sessions(sessions), end="", file=sys.stderr)
 
     while True:
         print("Select session number: ", end="", file=sys.stderr, flush=True)
@@ -510,12 +676,13 @@ def _pick_codex_session() -> CodexSession:
 
 
 def _find_codex_session_file(session_id: str) -> Path | None:
-    matches = [
-        session.path
-        for session in _discover_codex_sessions()
-        if session.session_id == session_id.lower()
-    ]
-    return matches[0] if matches else None
+    root = _codex_sessions_root()
+    if not root.exists():
+        return None
+    matches = list(root.rglob(f"*{session_id.lower()}.jsonl"))
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
 
 
 def _codex_session_relative_path(session_file: Path) -> str:

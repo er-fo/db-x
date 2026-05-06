@@ -14,51 +14,96 @@ from dbx.state import JobState
 
 
 class CliTests(unittest.TestCase):
-    def test_sessions_lists_local_codex_sessions_with_paths(self) -> None:
+    def test_sessions_prints_simple_ten_row_table_with_latest_user_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / ".codex" / "sessions"
-            session_a = root / "2026" / "05" / "06" / (
-                "rollout-2026-05-06T21-11-54-"
-                "019dfeb4-2e25-7173-8ab9-006893040db2.jsonl"
+            newest = _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="no, it shall give me an interactive list",
+                mtime=1100,
             )
-            session_b = root / "2026" / "05" / "05" / (
-                "rollout-2026-05-05T19-00-00-"
-                "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+            oldest = _write_codex_session(
+                root,
+                session_id="019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                created_at="2026-05-05T19:00:00Z",
+                latest_user_message="this one should be hidden by the ten row cap",
+                mtime=1,
             )
-            session_a.parent.mkdir(parents=True)
-            session_b.parent.mkdir(parents=True)
-            session_a.write_text("{}\n", encoding="utf-8")
-            session_b.write_text("{}\n", encoding="utf-8")
-            session_a.touch()
-            session_b.touch()
-            os.utime(session_a, (200, 200))
-            os.utime(session_b, (100, 100))
+            for index in range(9):
+                _write_codex_session(
+                    root,
+                    session_id=f"019dfaaa-0000-7000-8000-{index:012d}",
+                    created_at="2026-05-06T20:00:00Z",
+                    latest_user_message=f"middle message {index}",
+                    mtime=100 + index,
+                )
             with patch("dbx.cli._codex_sessions_root", return_value=root):
                 with patch("sys.stdout", new=io.StringIO()) as stdout:
                     exit_code = cli.main(["sessions"])
 
         self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("Created", output)
+        self.assertIn("Updated", output)
+        self.assertIn("Conversation", output)
+        self.assertIn("no, it shall give me an interactive list", output)
+        self.assertIn(str(newest), output)
+        self.assertNotIn("this one should be hidden", output)
+        self.assertNotIn(str(oldest), output)
+        self.assertEqual(output.count(".jsonl"), 10)
+
+    def test_sessions_json_is_available_for_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            session_path = _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="launch this one",
+                mtime=100,
+            )
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions", "--json"])
+
+        self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(len(payload), 2)
-        self.assertEqual(
-            payload[0]["session_id"],
-            "019dfeb4-2e25-7173-8ab9-006893040db2",
-        )
-        self.assertTrue(payload[0]["path"].endswith(str(session_a)))
-        self.assertEqual(
-            payload[1]["relative_path"],
-            "2026/05/05/rollout-2026-05-05T19-00-00-019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl",
-        )
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["latest_user_message"], "launch this one")
+        self.assertEqual(payload[0]["path"], str(session_path))
+
+    def test_sessions_ignore_internal_user_role_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="real user request",
+                mtime=100,
+                extra_user_message="<subagent_notification>{}</subagent_notification>",
+            )
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions"])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("real user request", output)
+        self.assertNotIn("subagent_notification", output)
 
     def test_start_can_pick_resume_session_interactively(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / ".codex" / "sessions"
-            picked_session = root / "2026" / "05" / "06" / (
-                "rollout-2026-05-06T21-11-54-"
-                "019dfeb4-2e25-7173-8ab9-006893040db2.jsonl"
+            picked_session = _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="resume the deployment planning session",
+                mtime=100,
             )
-            picked_session.parent.mkdir(parents=True)
-            picked_session.write_text("{}\n", encoding="utf-8")
             config_path = Path(tmpdir) / "config.toml"
             mission_path = Path(tmpdir) / "mission.md"
             config_path.write_text(_sample_config(), encoding="utf-8")
@@ -98,6 +143,9 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("Local Codex sessions", stderr.getvalue())
+        self.assertIn("Created", stderr.getvalue())
+        self.assertIn("Conversation", stderr.getvalue())
+        self.assertIn("resume the deployment planning session", stderr.getvalue())
         self.assertIn(str(picked_session), stderr.getvalue())
         self.assertTrue(saved_jobs)
         self.assertEqual(
@@ -646,6 +694,77 @@ def _sample_job_state() -> JobState:
         lifecycle_state="running",
         status="ready",
     )
+
+
+def _write_codex_session(
+    root: Path,
+    *,
+    session_id: str,
+    created_at: str,
+    latest_user_message: str,
+    mtime: int,
+    extra_user_message: str | None = None,
+) -> Path:
+    date_part, time_part = created_at.removesuffix("Z").split("T")
+    year, month, day = date_part.split("-")
+    filename_time = time_part.replace(":", "-")
+    session_path = root / year / month / day / f"rollout-{date_part}T{filename_time}-{session_id}.jsonl"
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "type": "session_meta",
+            "timestamp": created_at,
+            "payload": {
+                "timestamp": created_at,
+                "cwd": "/tmp/repo",
+                "git": {"branch": "main"},
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": created_at,
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "older user message"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": created_at,
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "<environment_context>ignore this</environment_context>\n"
+                            f"{latest_user_message}"
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+    if extra_user_message is not None:
+        records.append(
+            {
+                "type": "response_item",
+                "timestamp": created_at,
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": extra_user_message}],
+                },
+            }
+        )
+    session_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    os.utime(session_path, (mtime, mtime))
+    return session_path
 
 
 class _TTYInput(io.StringIO):
