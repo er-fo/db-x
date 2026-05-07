@@ -1268,6 +1268,72 @@ class CliTests(unittest.TestCase):
         persisted_codex_log = persist_remote_artifacts.call_args.args[1]["codex_log"]
         self.assertIn("refresh token was already used", persisted_codex_log)
 
+    def test_status_uses_remote_blocked_state_when_status_json_is_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            saved_jobs = []
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "PrivateDnsName": "dbx-job",
+                    "PrivateIpAddress": "10.0.0.1",
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli.load_job_state",
+                    return_value=_sample_job_state(),
+                ):
+                    with patch(
+                        "dbx.cli.describe_instance_status",
+                        return_value={
+                            "SystemStatus": {"Status": "ok"},
+                            "InstanceStatus": {"Status": "ok"},
+                        },
+                    ):
+                        with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                            with patch(
+                                "dbx.cli._capture_remote_artifacts",
+                                return_value={
+                                    "status_json": {
+                                        "phase": "bootstrap",
+                                        "state": "blocked",
+                                        "detail": "codex_auth_failed",
+                                    },
+                                    "status_md": "# dbx-job\n",
+                                    "blocker": "# blocker\n",
+                                    "bootstrap_log": "boot\n",
+                                    "preflight_log": "preflight\n",
+                                    "codex_log": None,
+                                    "finish_log": "",
+                                },
+                            ):
+                                with patch("dbx.cli._persist_remote_artifacts"):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "status",
+                                                    "i-123",
+                                                    "--logs",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["last_error"], "codex_auth_failed")
+        self.assertEqual(saved_jobs[-1].status, "blocked")
+        self.assertEqual(saved_jobs[-1].last_error, "codex_auth_failed")
+
     def test_monitor_once_shows_only_git_status_and_codex_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
@@ -1710,6 +1776,63 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(saved_jobs[-1].status, "ready")
+        self.assertEqual(saved_jobs[-1].lifecycle_state, "terminated")
+
+    def test_terminate_uses_remote_terminal_state_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            saved_jobs = []
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli._load_or_infer_job_state",
+                    return_value=_sample_job_state(),
+                ):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch(
+                            "dbx.cli._capture_remote_artifacts",
+                            return_value={
+                                "status_json": {
+                                    "phase": "bootstrap",
+                                    "state": "blocked",
+                                    "detail": "codex_auth_failed",
+                                },
+                                "status_md": "# dbx-job\n",
+                                "blocker": "# blocker\n",
+                                "bootstrap_log": "boot\n",
+                                "preflight_log": "preflight\n",
+                                "codex_log": None,
+                                "finish_log": "",
+                            },
+                        ):
+                            with patch("dbx.cli._persist_remote_artifacts"):
+                                with patch(
+                                    "dbx.cli.terminate_instance",
+                                    return_value={"TerminatingInstances": [{"InstanceId": "i-123"}]},
+                                ):
+                                    with patch(
+                                        "dbx.cli.wait_for_instance_terminated",
+                                        return_value={"State": {"Name": "terminated"}},
+                                    ):
+                                        with patch(
+                                            "dbx.cli.save_job_state",
+                                            side_effect=saved_jobs.append,
+                                        ):
+                                            with patch("sys.stdout", new=io.StringIO()):
+                                                exit_code = cli.main(
+                                                    ["--config", str(config_path), "terminate", "i-123"]
+                                                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(saved_jobs[-1].status, "blocked")
+        self.assertEqual(saved_jobs[-1].last_error, "codex_auth_failed")
         self.assertEqual(saved_jobs[-1].lifecycle_state, "terminated")
 
     def test_terminate_continues_when_remote_artifact_capture_fails(self) -> None:

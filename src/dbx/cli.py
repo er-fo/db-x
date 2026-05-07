@@ -1884,12 +1884,19 @@ def _build_status_summary(
         summary["status_markdown"] = artifacts.get("status_md")
         summary["blocker"] = artifacts.get("blocker")
         runtime_issue = _runtime_issue_from_artifacts(artifacts)
+        terminal_issue = _terminal_issue_from_artifacts(artifacts)
         if runtime_issue is not None:
             summary["status"] = runtime_issue["status"]
             summary["last_error"] = runtime_issue["detail"]
             summary["runtime_issue"] = runtime_issue
             summary["blocker"] = summary["blocker"] or runtime_issue["blocker"]
             updated_state = _apply_runtime_issue_to_job_state(local_state, runtime_issue)
+            if updated_state != local_state:
+                save_job_state(updated_state)
+        elif terminal_issue is not None:
+            summary["status"] = terminal_issue["status"]
+            summary["last_error"] = terminal_issue["detail"]
+            updated_state = _apply_runtime_issue_to_job_state(local_state, terminal_issue)
             if updated_state != local_state:
                 save_job_state(updated_state)
         if isinstance(artifacts.get("errors"), dict) and artifacts["errors"]:
@@ -1939,11 +1946,22 @@ def _terminate_job(
     if artifacts:
         payload["artifacts"] = _artifact_excerpts(artifacts)
 
+    terminal_issue = _runtime_issue_from_artifacts(artifacts) or _terminal_issue_from_artifacts(
+        artifacts
+    )
+    resolved_status = status_override or local_state.status
+    resolved_last_error = last_error
+    if terminal_issue is not None:
+        if status_override is None:
+            resolved_status = terminal_issue["status"]
+        if last_error is None:
+            resolved_last_error = terminal_issue["detail"]
+
     updated_state = replace(
         local_state,
         lifecycle_state="terminated",
-        status=status_override or local_state.status,
-        last_error=last_error,
+        status=resolved_status,
+        last_error=resolved_last_error,
         terminated_at=created_at_now(),
     )
     save_job_state(updated_state)
@@ -2349,6 +2367,24 @@ def _runtime_issue_from_artifacts(artifacts: dict[str, object]) -> dict[str, str
     if not isinstance(codex_log, str):
         return None
     return _runtime_issue_from_codex_log(codex_log)
+
+
+def _terminal_issue_from_artifacts(artifacts: dict[str, object]) -> dict[str, str] | None:
+    status_json = artifacts.get("status_json")
+    if not isinstance(status_json, dict):
+        return None
+    status = str(status_json.get("state") or "")
+    if status not in REMOTE_NON_SUCCESS_STATES:
+        return None
+    detail = str(status_json.get("detail") or status)
+    blocker = artifacts.get("blocker")
+    issue = {
+        "status": status,
+        "detail": detail,
+    }
+    if isinstance(blocker, str) and blocker:
+        issue["blocker"] = blocker
+    return issue
 
 
 def _runtime_issue_from_job_state(job_state: JobState) -> dict[str, str] | None:
