@@ -21,6 +21,7 @@ class JobState:
     created_at: str
     resume_session_id: str | None = None
     job_root: str = ""
+    base_branch: str = "main"
     lifecycle_state: str = "created"
     status: str = "pending"
     pr_url: str | None = None
@@ -55,6 +56,7 @@ def load_job_state(instance_id: str, state_dir: Path | None = None) -> JobState 
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload.setdefault("job_root", "")
+    payload.setdefault("base_branch", "main")
     payload.setdefault("lifecycle_state", "created")
     payload.setdefault("status", "pending")
     payload.setdefault("resume_session_id", None)

@@ -10,6 +10,8 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "db-x" / "config.toml"
 DEFAULT_CONFIG_TEMPLATE = """aws_profile = "personal"
 aws_region = "eu-north-1"
 default_owner = "er-fo"
+default_repo = "er-fo/db-x"
+default_mission = "missions/bootstrap.md"
 default_base_branch = "main"
 ami_id = "ami-xxxxxxxxxxxxxxxxx"
 subnet_id = "subnet-xxxxxxxxxxxxxxxxx"
@@ -29,6 +31,8 @@ class AppConfig:
     aws_profile: str | None
     aws_region: str
     default_owner: str
+    default_repo: str | None
+    default_mission: str | None
     default_base_branch: str
     ami_id: str
     subnet_id: str
@@ -69,6 +73,8 @@ def load_config(explicit_path: str | None = None) -> AppConfig:
         aws_profile=_optional_str(data.get("aws_profile")),
         aws_region=_required_str(data, "aws_region"),
         default_owner=_required_str(data, "default_owner"),
+        default_repo=_optional_str(data.get("default_repo")),
+        default_mission=_optional_str(data.get("default_mission")),
         default_base_branch=_required_str(data, "default_base_branch"),
         ami_id=_required_str(data, "ami_id"),
         subnet_id=_required_str(data, "subnet_id"),

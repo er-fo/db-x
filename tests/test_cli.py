@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,10 +15,327 @@ from dbx.state import JobState
 
 
 class CliTests(unittest.TestCase):
+    def test_sessions_prints_simple_ten_row_table_with_latest_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            newest = _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="no, it shall give me an interactive list",
+                mtime=1100,
+            )
+            oldest = _write_codex_session(
+                root,
+                session_id="019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                created_at="2026-05-05T19:00:00Z",
+                latest_user_message="this one should be hidden by the ten row cap",
+                mtime=1,
+            )
+            for index in range(9):
+                _write_codex_session(
+                    root,
+                    session_id=f"019dfaaa-0000-7000-8000-{index:012d}",
+                    created_at="2026-05-06T20:00:00Z",
+                    latest_user_message=f"middle message {index}",
+                    mtime=100 + index,
+                )
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions"])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("Created", output)
+        self.assertIn("Updated", output)
+        self.assertIn("Conversation", output)
+        self.assertIn("no, it shall give me an interactive list", output)
+        self.assertIn(str(newest), output)
+        self.assertNotIn("this one should be hidden", output)
+        self.assertNotIn(str(oldest), output)
+        self.assertEqual(output.count(".jsonl"), 10)
+
+    def test_sessions_json_is_available_for_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            session_path = _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="launch this one",
+                mtime=100,
+            )
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions", "--json"])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["latest_user_message"], "launch this one")
+        self.assertEqual(payload[0]["path"], str(session_path))
+
+    def test_sessions_ignore_internal_user_role_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="real user request",
+                mtime=100,
+                extra_user_message="<subagent_notification>{}</subagent_notification>",
+            )
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions"])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("real user request", output)
+        self.assertNotIn("subagent_notification", output)
+
+    def test_sessions_exclude_subagent_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="real user session",
+                mtime=100,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfebf-7ab2-74e1-88b1-0c5affae2018",
+                created_at="2026-05-06T21:24:14Z",
+                latest_user_message="You are reviewing the backend spec-first integration",
+                mtime=200,
+                source={"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}},
+            )
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["sessions"])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("real user session", output)
+        self.assertNotIn("You are reviewing", output)
+        self.assertEqual(output.count(".jsonl"), 1)
+
+    def test_start_can_pick_resume_session_interactively(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            picked_session = _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="resume the deployment planning session",
+                mtime=100,
+            )
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            stdin = _TTYInput("1\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "start",
+                                                    "er-fo/db-x",
+                                                    str(mission_path),
+                                                    "--pick-session",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Local Codex sessions", stderr.getvalue())
+        self.assertIn("Created", stderr.getvalue())
+        self.assertIn("Conversation", stderr.getvalue())
+        self.assertIn("resume the deployment planning session", stderr.getvalue())
+        self.assertIn(str(picked_session), stderr.getvalue())
+        self.assertTrue(saved_jobs)
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["resume_session_id"],
+            "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+
+    def test_start_picker_accepts_arrow_key_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="first visible session",
+                mtime=200,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfe10-8e20-7580-ba09-86c21ace5c81",
+                created_at="2026-05-06T18:13:11Z",
+                latest_user_message="second visible session",
+                mtime=100,
+            )
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            stdin = _TTYInput("\x1b[B\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()):
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "start",
+                                                    "er-fo/db-x",
+                                                    str(mission_path),
+                                                    "--pick-session",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Use ↑/↓", stderr.getvalue())
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfe10-8e20-7580-ba09-86c21ace5c81",
+        )
+
+    def test_start_picker_accepts_pasted_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="first visible session",
+                mtime=200,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfe10-8e20-7580-ba09-86c21ace5c81",
+                created_at="2026-05-06T18:13:11Z",
+                latest_user_message="second visible session",
+                mtime=100,
+            )
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            stdin = _TTYInput("019dfe10-8e20-7580-ba09-86c21ace5c81\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()):
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()):
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "start",
+                                                    "er-fo/db-x",
+                                                    str(mission_path),
+                                                    "--pick-session",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfe10-8e20-7580-ba09-86c21ace5c81",
+        )
+
+    def test_start_pick_session_fails_when_not_interactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch("sys.stdin", new=io.StringIO("")):
+                with patch("sys.stderr", new=io.StringIO()) as stderr:
+                    exit_code = cli.main(
+                        [
+                            "--config",
+                            str(config_path),
+                            "start",
+                            "er-fo/db-x",
+                            str(mission_path),
+                            "--pick-session",
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("Cannot pick a Codex session without an interactive terminal", stderr.getvalue())
+
     def test_doctor_fails_without_config(self) -> None:
-        with patch("dbx.cli.shutil.which", return_value="/usr/bin/fake"):
-            with patch("sys.stdout", new=io.StringIO()) as stdout:
-                exit_code = cli.main(["doctor"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "missing.toml"
+            with patch("dbx.cli.shutil.which", return_value="/usr/bin/fake"):
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    exit_code = cli.main(["--config", str(config_path), "doctor"])
         self.assertEqual(exit_code, 1)
         self.assertIn('"config_ok": false', stdout.getvalue())
 
@@ -92,8 +411,265 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["instance_id"], "i-123")
         self.assertEqual(payload["runtime"]["state"], "ready")
 
+    def test_start_without_args_runs_resume_wizard_with_configured_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="resume default launch",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            saved_jobs = []
+            stdin = _TTYInput("\n\n\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ) as launch_instance:
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                            exit_code = cli.main(
+                                                ["--config", str(config_path), "start"]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        wizard_output = stderr.getvalue()
+        self.assertIn("dbx start launch wizard", wizard_output)
+        self.assertIn("Step 1/3: Choose launch mode", wizard_output)
+        self.assertIn("Resume local Codex session", wizard_output)
+        self.assertIn("Step 2/3: Choose Codex session", wizard_output)
+        self.assertIn("Currently selected", wizard_output)
+        self.assertIn("resume default launch", wizard_output)
+        self.assertIn("Step 3/3: Review launch", wizard_output)
+        self.assertIn("Repo: er-fo/db-x", wizard_output)
+        self.assertIn(f"Mission: {mission_path.resolve()}", wizard_output)
+        self.assertIn("AWS: c7i.xlarge in eu-north-1", wizard_output)
+        self.assertEqual(saved_jobs[-1].repo, "er-fo/db-x")
+        self.assertEqual(saved_jobs[-1].mission_path, str(mission_path.resolve()))
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfeb4-2e25-7173-8ab9-006893040db2",
+        )
+        request = launch_instance.call_args.args[1]
+        self.assertEqual(request.repo, "er-fo/db-x")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["instance_id"], "i-123")
+
+    def test_start_wizard_can_launch_fresh_mission_without_resume_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="available but not resumed",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            saved_jobs = []
+            stdin = _TTYInput("\x1b[B\n\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli.save_job_state",
+                                    side_effect=saved_jobs.append,
+                                ):
+                                    with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                        exit_code = cli.main(
+                                            ["--config", str(config_path), "start"]
+                                        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Start fresh mission", stderr.getvalue())
+        self.assertIsNone(saved_jobs[-1].resume_session_id)
+        payload = json.loads(stdout.getvalue())
+        self.assertIsNone(payload["resume_session_id"])
+
+    def test_start_wizard_accepts_pasted_session_id_before_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="first visible session",
+                mtime=200,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfe10-8e20-7580-ba09-86c21ace5c81",
+                created_at="2026-05-06T18:13:11Z",
+                latest_user_message="pasted session to resume",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            saved_jobs = []
+            stdin = _TTYInput("\x1b[B\x1b[B\n019dfe10-8e20-7580-ba09-86c21ace5c81\n\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()):
+                                            exit_code = cli.main(
+                                                ["--config", str(config_path), "start"]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Paste session ID or path", stderr.getvalue())
+        self.assertIn("pasted session to resume", stderr.getvalue())
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfe10-8e20-7580-ba09-86c21ace5c81",
+        )
+
+    def test_start_wizard_cancel_does_not_launch_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="do not launch this",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            stdin = _TTYInput("q")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch("dbx.cli.launch_instance") as launch_instance:
+                            exit_code = cli.main(["--config", str(config_path), "start"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("No dbx launch selected", stderr.getvalue())
+        launch_instance.assert_not_called()
+
+    def test_start_wizard_session_preview_renders_selected_details(self) -> None:
+        session_path = Path(
+            "/tmp/sessions/2026/05/06/"
+            "rollout-2026-05-06T21-11-54-019dfeb4-2e25-7173-8ab9-006893040db2.jsonl"
+        )
+        session = cli.CodexSession(
+            session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+            path=session_path,
+            relative_path="2026/05/06/rollout.jsonl",
+            created_at="2026-05-06T21:11:54Z",
+            updated_at="2026-05-06T21:15:00Z",
+            branch="main",
+            latest_user_message="make the selector more interactive",
+            size_bytes=1234,
+        )
+        output = io.StringIO()
+
+        cli._render_codex_session_picker(
+            [session],
+            selected_index=0,
+            typed="",
+            output_stream=output,
+            clear_screen=False,
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("Currently selected", rendered)
+        self.assertIn("make the selector more interactive", rendered)
+        self.assertIn("Branch: main", rendered)
+        self.assertIn("Session: 019dfeb4-2e25-7173-8ab9-006893040db2", rendered)
+        self.assertIn(str(session_path), rendered)
+
+    def test_start_without_args_requires_configured_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            with patch("sys.stderr", new=io.StringIO()) as stderr:
+                exit_code = cli.main(["--config", str(config_path), "start"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("default_repo", stderr.getvalue())
+        self.assertIn("default_mission", stderr.getvalue())
+
     def test_start_forwards_resume_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                created_at="2026-05-06T16:23:44Z",
+                latest_user_message="resume this work",
+                mtime=100,
+                branch="feature/base",
+            )
             config_path = Path(tmpdir) / "config.toml"
             mission_path = Path(tmpdir) / "mission.md"
             config_path.write_text(_sample_config(), encoding="utf-8")
@@ -108,40 +684,30 @@ class CliTests(unittest.TestCase):
                     return_value={"phase": "runtime", "state": "ready"},
                     create=True,
                 ):
-                    with patch(
-                        "dbx.cli._find_codex_session_file",
-                        return_value=Path("/tmp/session.jsonl"),
-                    ):
-                        with patch(
-                            "dbx.cli._codex_session_relative_path",
-                            return_value=(
-                                "2026/05/06/rollout-2026-05-06T16-23-44-"
-                                "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
-                            ),
-                        ):
+                    with patch("dbx.cli._codex_sessions_root", return_value=root):
+                        with patch("dbx.cli._upload_resume_session_when_reachable") as upload_session:
+                            upload_session.return_value = {
+                                "remote_path": (
+                                    "/home/ubuntu/.codex/sessions/2026/05/06/"
+                                    "rollout-2026-05-06T16-23-44-"
+                                    "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+                                )
+                            }
                             with patch(
-                                "dbx.cli._upload_resume_session_when_reachable",
-                                return_value={
-                                    "remote_path": (
-                                        "/home/ubuntu/.codex/sessions/2026/05/06/"
-                                        "rollout-2026-05-06T16-23-44-"
-                                        "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+                                "dbx.cli.save_job_state", side_effect=saved_jobs.append
+                            ):
+                                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                    exit_code = cli.main(
+                                        [
+                                            "--config",
+                                            str(config_path),
+                                            "start",
+                                            "--resume-session",
+                                            "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                                            "er-fo/db-x",
+                                            str(mission_path),
+                                        ]
                                     )
-                                },
-                            ) as upload_session:
-                                with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
-                                    with patch("sys.stdout", new=io.StringIO()) as stdout:
-                                        exit_code = cli.main(
-                                            [
-                                                "--config",
-                                                str(config_path),
-                                                "start",
-                                                "--resume-session",
-                                                "019dfdac-5bea-71f0-91c5-4fdd8826860b",
-                                                "er-fo/db-x",
-                                                str(mission_path),
-                                            ]
-                                        )
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(saved_jobs)
@@ -159,6 +725,8 @@ class CliTests(unittest.TestCase):
             request.resume_session_relative_path,
             "2026/05/06/rollout-2026-05-06T16-23-44-019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl",
         )
+        self.assertEqual(request.base_branch, "feature/base")
+        self.assertEqual(saved_jobs[-1].base_branch, "feature/base")
         upload_session.assert_called_once()
 
     def test_start_fails_when_requested_resume_session_is_not_local(self) -> None:
@@ -253,24 +821,46 @@ class CliTests(unittest.TestCase):
                                 "dbx.cli._run_finish_remote",
                                 return_value={"pr_url": "https://github.com/er-fo/db-x/pull/1"},
                             ):
-                                with patch(
-                                    "dbx.cli._terminate_job",
-                                    return_value={"final_state": "terminated"},
-                                ) as terminate_job:
+                                with patch("dbx.cli._persist_remote_artifacts"):
                                     with patch(
-                                        "dbx.cli.save_job_state",
-                                        side_effect=saved_jobs.append,
-                                    ):
-                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
-                                            exit_code = cli.main(
-                                                ["--config", str(config_path), "finish", "i-123"]
-                                            )
+                                        "dbx.cli._terminate_job",
+                                        return_value={"final_state": "terminated"},
+                                    ) as terminate_job:
+                                        with patch(
+                                            "dbx.cli.save_job_state",
+                                            side_effect=saved_jobs.append,
+                                        ):
+                                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                                exit_code = cli.main(
+                                                    ["--config", str(config_path), "finish", "i-123"]
+                                                )
 
         self.assertEqual(exit_code, 0)
         terminate_job.assert_called_once()
         self.assertEqual(saved_jobs[-1].pr_url, "https://github.com/er-fo/db-x/pull/1")
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["termination"]["final_state"], "terminated")
+
+    def test_finish_remote_delegates_to_vm_finish_script(self) -> None:
+        job_state = _sample_job_state()
+        with patch("dbx.cli.run_remote_shell_command") as run_remote:
+            with patch(
+                "dbx.cli._read_remote_command_output",
+                return_value="https://github.com/er-fo/db-x/pull/1\n",
+            ):
+                result = cli._run_finish_remote(
+                    "ubuntu@dbx-job",
+                    job_state,
+                    "feature/base",
+                    no_pr=False,
+                    blocked=True,
+                )
+
+        self.assertEqual(result["pr_url"], "https://github.com/er-fo/db-x/pull/1")
+        remote_script = run_remote.call_args.args[1]
+        self.assertIn("/usr/local/bin/dbx-finish-job", remote_script)
+        self.assertIn("--mode blocked", remote_script)
+        self.assertIn("--base feature/base", remote_script)
 
     def test_status_includes_remote_logs_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -309,15 +899,150 @@ class CliTests(unittest.TestCase):
                                     "finish_log": "finish\n",
                                 },
                             ):
-                                with patch("sys.stdout", new=io.StringIO()) as stdout:
-                                    exit_code = cli.main(
-                                        ["--config", str(config_path), "status", "i-123", "--logs"]
-                                    )
+                                with patch("dbx.cli._persist_remote_artifacts"):
+                                    with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                        exit_code = cli.main(
+                                            ["--config", str(config_path), "status", "i-123", "--logs"]
+                                        )
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["remote_status"]["state"], "ready")
         self.assertEqual(payload["logs"]["codex"], "codex\n")
+
+    def test_monitor_once_shows_only_git_status_and_codex_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+
+            def fake_remote_command(target: str, shell_command: str, **kwargs):
+                if "git status --short --branch" in shell_command:
+                    return subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout="## agent/test...origin/main\n M src/dbx/cli.py\n",
+                        stderr="",
+                    )
+                if "tail -n 80" in shell_command and "logs/codex.log" in shell_command:
+                    return subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout="codex line 1\ncodex line 2\n",
+                        stderr="",
+                    )
+                raise AssertionError(f"unexpected remote command: {shell_command}")
+
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli._load_or_infer_job_state",
+                    return_value=_sample_job_state(),
+                ):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch(
+                            "dbx.cli.run_remote_shell_command",
+                            side_effect=fake_remote_command,
+                        ):
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                exit_code = cli.main(
+                                    ["--config", str(config_path), "monitor", "i-123", "--once"]
+                                )
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("Git", output)
+        self.assertIn("## agent/test...origin/main", output)
+        self.assertIn(" M src/dbx/cli.py", output)
+        self.assertIn("Codex output", output)
+        self.assertIn("codex line 2", output)
+        self.assertNotIn("STATUS.md", output)
+        self.assertNotIn("bootstrap", output)
+
+    def test_start_monitor_launches_then_monitors_on_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            with patch(
+                "dbx.cli.launch_instance",
+                return_value={"Instances": [{"InstanceId": "i-123"}]},
+            ):
+                with patch(
+                    "dbx.cli._wait_for_runtime_ready",
+                    return_value={"phase": "runtime", "state": "ready"},
+                ):
+                    with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
+                        with patch("dbx.cli.run_monitor", return_value=0) as monitor:
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                with patch("sys.stderr", new=io.StringIO()) as stderr:
+                                    exit_code = cli.main(
+                                        [
+                                            "--config",
+                                            str(config_path),
+                                            "start",
+                                            "er-fo/db-x",
+                                            str(mission_path),
+                                            "--monitor",
+                                        ]
+                                    )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["instance_id"], "i-123")
+        self.assertEqual(stderr.getvalue(), "")
+        monitor.assert_called_once()
+        self.assertEqual(monitor.call_args.args[1], "i-123")
+        self.assertIs(monitor.call_args.kwargs["output_stream"], stderr)
+        self.assertTrue(saved_jobs)
+
+    def test_start_monitor_requires_runtime_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch("sys.stderr", new=io.StringIO()) as stderr:
+                exit_code = cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "start",
+                        "er-fo/db-x",
+                        str(mission_path),
+                        "--no-wait",
+                        "--monitor",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("--monitor requires runtime verification", stderr.getvalue())
+
+    def test_live_render_uses_alternate_screen_sequences_when_clearing(self) -> None:
+        output = io.StringIO()
+
+        cli._render_monitor_snapshot(
+            job_id="i-123",
+            git_status="## main\n",
+            codex_log="codex\n",
+            output_stream=output,
+            clear_screen=True,
+            lines=80,
+            interval_seconds=2.0,
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("\033[?1049h", rendered)
+        self.assertIn("\033[2J\033[H", rendered)
+        self.assertIn("Git", rendered)
+        self.assertIn("Codex output", rendered)
 
     def test_wait_for_runtime_ready_reports_but_does_not_block_on_ec2_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -463,15 +1188,16 @@ class CliTests(unittest.TestCase):
                                             "dbx.cli.wait_for_instance_terminated",
                                             return_value={"State": {"Name": "terminated"}},
                                         ):
-                                            with patch("sys.stdout", new=io.StringIO()):
-                                                exit_code = cli.main(
-                                                    [
-                                                        "--config",
-                                                        str(config_path),
-                                                        "terminate",
-                                                        "i-123",
-                                                    ]
-                                                )
+                                            with patch("dbx.cli.save_job_state"):
+                                                with patch("sys.stdout", new=io.StringIO()):
+                                                    exit_code = cli.main(
+                                                        [
+                                                            "--config",
+                                                            str(config_path),
+                                                            "terminate",
+                                                            "i-123",
+                                                        ]
+                                                    )
 
         self.assertEqual(exit_code, 0)
         terminate_instance.assert_called_once()
@@ -522,6 +1248,95 @@ def _sample_job_state() -> JobState:
         mission_path="/tmp/mission.md",
         created_at="2026-05-06T12:00:00Z",
         job_root="/home/ubuntu/work/dbx-job",
+        base_branch="feature/base",
         lifecycle_state="running",
         status="ready",
     )
+
+
+def _write_codex_session(
+    root: Path,
+    *,
+    session_id: str,
+    created_at: str,
+    latest_user_message: str,
+    mtime: int,
+    extra_user_message: str | None = None,
+    source: object = "cli",
+    branch: str = "main",
+) -> Path:
+    date_part, time_part = created_at.removesuffix("Z").split("T")
+    year, month, day = date_part.split("-")
+    filename_time = time_part.replace(":", "-")
+    session_path = root / year / month / day / f"rollout-{date_part}T{filename_time}-{session_id}.jsonl"
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "type": "session_meta",
+            "timestamp": created_at,
+            "payload": {
+                "timestamp": created_at,
+                "cwd": "/tmp/repo",
+                "git": {"branch": branch},
+                "source": source,
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": created_at,
+            "payload": {
+                "type": "user_message",
+                "message": latest_user_message,
+                "text_elements": [],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": created_at,
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "older user message"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": created_at,
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "<environment_context>ignore this</environment_context>\n"
+                            f"{latest_user_message}"
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+    if extra_user_message is not None:
+        records.append(
+            {
+                "type": "response_item",
+                "timestamp": created_at,
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": extra_user_message}],
+                },
+            }
+        )
+    session_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    os.utime(session_path, (mtime, mtime))
+    return session_path
+
+
+class _TTYInput(io.StringIO):
+    def isatty(self) -> bool:
+        return True

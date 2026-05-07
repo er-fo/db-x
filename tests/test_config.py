@@ -21,6 +21,8 @@ class ConfigTests(unittest.TestCase):
 aws_profile = "personal"
 aws_region = "eu-north-1"
 default_owner = "er-fo"
+default_repo = "er-fo/db-x"
+default_mission = "/tmp/mission.md"
 default_base_branch = "main"
 ami_id = "ami-123"
 subnet_id = "subnet-123"
@@ -39,6 +41,8 @@ job_prefix = "dbx"
 
         self.assertEqual(config.aws_profile, "personal")
         self.assertEqual(config.aws_region, "eu-north-1")
+        self.assertEqual(config.default_repo, "er-fo/db-x")
+        self.assertEqual(config.default_mission, "/tmp/mission.md")
         self.assertEqual(config.tailscale_domain, "tailnet.ts.net")
         self.assertEqual(config.tailscale_auth_key, "tskey-auth-123")
         self.assertEqual(config.tailscale_tags, ("tag:dbx",))

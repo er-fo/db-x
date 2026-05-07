@@ -2,6 +2,12 @@
 
 `db-x` is a disposable AWS devbox runner for long-running Codex + Superpowers work.
 
+The purpose is handoff continuity: when Erik is moving between places, agents
+should keep running, preserve context, and finish the task while he is on the
+move. `db-x` announces the environment and mission to a fresh VM agent so it can
+continue the work, keep git clean, and hand the completed or blocked branch to a
+pull request lifecycle without requiring Erik's laptop to stay online.
+
 It launches a fresh EC2 instance per mission, boots it from a private golden AMI,
 runs Codex inside `tmux`, and then terminates the machine when the work is done
 or blocked. The goal is simple: keep the autonomy and long-running ergonomics of
@@ -15,8 +21,9 @@ a real devbox without leaving compute running between jobs.
 - Keeps Codex running in `tmux`
 - Clones the repo, creates a branch, and starts Codex on-instance
 - Keeps local job metadata so `list` and `status` stay informative
-- Preserves remote work, pushes the job branch, opens a PR, and terminates the
-  instance with `finish`
+- Installs a VM-local Codex Stop hook and watcher so completion/blocker handoff
+  can preserve remote work, push the job branch, open or update a PR, and shut
+  down the instance after the PR URL is confirmed
 
 ## What it does not do yet
 
@@ -30,18 +37,63 @@ a real devbox without leaving compute running between jobs.
 ```bash
 dbx init-config
 dbx doctor
+dbx sessions
+dbx start
+dbx start --monitor
 dbx start er-fo/db-x missions/bootstrap.md
-dbx start er-fo/db-x missions/bootstrap.md --resume-session 00000000-0000-0000-0000-000000000000
+dbx start er-fo/db-x missions/bootstrap.md --pick-session
 dbx list
 dbx status i-0123456789abcdef0
 dbx status i-0123456789abcdef0 --logs
 dbx attach i-0123456789abcdef0
 dbx attach i-0123456789abcdef0 --check
+dbx monitor i-0123456789abcdef0
 dbx finish i-0123456789abcdef0
 dbx terminate i-0123456789abcdef0
 ```
 
+Use `dbx start` for the normal guided launch flow. It uses `default_repo` and
+`default_mission` from the config, then opens a terminal wizard that lets you
+resume a local Codex session, start a fresh mission, paste a session ID/path,
+and review the exact repo, mission, AWS target, and resume choice before any EC2
+instance is launched. The session step shows a live "Currently selected" preview
+with the conversation, branch, session ID, and full path, so the launch purpose
+is clear before you press Enter.
+
+`dbx sessions` prints the same simple 10-row table with created time, updated
+time, branch, full session path, and latest user message. Subagent sessions are
+excluded, so the list shows direct user-submitted conversations.
+`dbx start <repo> <mission>` and `--resume-session <session-id>` remain
+available for scripted launches.
+
+Use `dbx start --monitor` to launch and immediately watch the devbox's live
+work. Use `dbx monitor <instance-id>` to attach the same focused monitor later.
+The monitor intentionally shows only remote `git status --short --branch` and
+the latest Codex output from `logs/codex.log`; it does not include cloud-init,
+finish, or status artifacts.
+
 `dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
+
+## Finish lifecycle
+
+The normal finish path is automatic. When the VM agent completes verified work,
+it runs:
+
+```bash
+dbx-finish-ready complete "short completion summary"
+```
+
+When it is safely blocked, it runs:
+
+```bash
+dbx-finish-ready blocked "short blocker summary"
+```
+
+The Codex Stop hook sees that readiness marker and runs the shared VM-local
+finish script. If Codex exits without a marker, the watcher treats the stop as
+unknown, creates or updates a draft PR, and shuts down only after the PR URL is
+confirmed. `dbx finish <instance-id>` remains available as an operator recovery
+command; it delegates to the same VM-local finish script.
 
 ## Config
 
@@ -65,6 +117,8 @@ Example:
 aws_profile = "personal"
 aws_region = "eu-north-1"
 default_owner = "er-fo"
+default_repo = "er-fo/db-x"
+default_mission = "missions/bootstrap.md"
 default_base_branch = "main"
 ami_id = "ami-xxxxxxxxxxxxxxxxx"
 subnet_id = "subnet-xxxxxxxxxxxxxxxxx"
