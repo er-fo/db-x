@@ -196,6 +196,11 @@ class AwsTests(unittest.TestCase):
         self.assertIn("dbx-codex-watch", script)
         self.assertIn("dbx-finish-ready complete", script)
         self.assertIn("dbx-finish-ready blocked", script)
+        self.assertLess(
+            script.index("[ -f \"$READY_FILE\" ] || exit 0"),
+            script.index("exec 9>\"$LOCK_FILE\""),
+        )
+        self.assertIn("DBX_FINISH_DONE", script)
 
 
 def _sample_config() -> str:
