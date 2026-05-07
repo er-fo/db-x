@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 import json
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -42,6 +43,11 @@ from .state import (
 
 PICK_SESSION = "__dbx_pick_session__"
 SESSION_LIST_LIMIT = 10
+DEFAULT_MONITOR_INTERVAL_SECONDS = 2.0
+DEFAULT_MONITOR_LOG_LINES = 80
+ALT_SCREEN_ENTER = "\033[?1049h"
+ALT_SCREEN_EXIT = "\033[?1049l"
+CLEAR_SCREEN = "\033[2J\033[H"
 SESSION_ID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -115,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
                 pick_session=args.pick_session,
                 wait=args.wait,
                 timeout_seconds=args.timeout,
+                monitor=args.monitor,
             )
         if args.command == "list":
             return run_list(config)
@@ -122,6 +129,14 @@ def main(argv: list[str] | None = None) -> int:
             return run_status(config, args.job_id, include_logs=args.logs)
         if args.command == "attach":
             return run_attach(config, args.job_id, check=args.check)
+        if args.command == "monitor":
+            return run_monitor(
+                config,
+                args.job_id,
+                interval_seconds=args.interval,
+                lines=args.lines,
+                once=args.once,
+            )
         if args.command == "finish":
             return run_finish(
                 config,
@@ -222,6 +237,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=600,
         help="Maximum seconds to wait for runtime verification.",
     )
+    start_parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="After launch, watch remote git status and Codex output.",
+    )
 
     subparsers.add_parser("list", help="List dbx-managed instances.")
 
@@ -244,6 +264,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="Verify the remote tmux session before printing the command.",
+    )
+
+    monitor_parser = subparsers.add_parser(
+        "monitor", help="Watch a devbox's git status and Codex output."
+    )
+    monitor_parser.add_argument("job_id", help="AWS instance ID.")
+    monitor_parser.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_MONITOR_INTERVAL_SECONDS,
+        help="Seconds between live monitor refreshes.",
+    )
+    monitor_parser.add_argument(
+        "--lines",
+        type=int,
+        default=DEFAULT_MONITOR_LOG_LINES,
+        help="Number of Codex log lines to show.",
+    )
+    monitor_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Print one monitor snapshot and exit.",
     )
 
     finish_parser = subparsers.add_parser(
@@ -365,7 +407,12 @@ def run_start(
     pick_session: bool = False,
     wait: bool = True,
     timeout_seconds: int = 600,
+    monitor: bool = False,
 ) -> int:
+    if monitor and not wait:
+        print("--monitor requires runtime verification; remove --no-wait.", file=sys.stderr)
+        return 2
+
     should_run_wizard = (
         repo is None and mission is None and resume_session_id is None and not pick_session
     )
@@ -491,6 +538,8 @@ def run_start(
     if runtime is not None:
         output["runtime"] = runtime
     print(json.dumps(output, indent=2))
+    if monitor:
+        return run_monitor(config, instance_id, output_stream=sys.stderr)
     return 0
 
 
@@ -855,7 +904,7 @@ def _run_codex_session_picker(
     typed = ""
     use_screen = _stream_is_tty(output_stream)
 
-    with _raw_terminal(input_stream):
+    with _raw_terminal(input_stream), _live_screen(output_stream, use_screen):
         while True:
             _render_codex_session_picker(
                 sessions,
@@ -904,8 +953,7 @@ def _render_codex_session_picker(
     heading: str = "Local Codex sessions",
     step_label: str | None = None,
 ) -> None:
-    if clear_screen:
-        output_stream.write("\033[2J\033[H")
+    _clear_live_screen(output_stream, clear_screen)
     output_stream.write(f"{heading}\n")
     if step_label:
         output_stream.write(f"{step_label}\n")
@@ -945,7 +993,7 @@ def _run_pasted_session_picker(
     error = ""
     use_screen = _stream_is_tty(output_stream)
 
-    with _raw_terminal(input_stream):
+    with _raw_terminal(input_stream), _live_screen(output_stream, use_screen):
         while True:
             _render_pasted_session_picker(
                 typed=typed,
@@ -980,8 +1028,7 @@ def _render_pasted_session_picker(
     output_stream,
     clear_screen: bool,
 ) -> None:
-    if clear_screen:
-        output_stream.write("\033[2J\033[H")
+    _clear_live_screen(output_stream, clear_screen)
     output_stream.write("dbx start launch wizard\n")
     output_stream.write("Step 2/3: Paste session ID or path\n")
     output_stream.write("Paste a Codex session UUID or .jsonl path, then press Enter.\n")
@@ -1061,7 +1108,7 @@ def _run_wizard_menu(
     selected_index = 0
     use_screen = _stream_is_tty(output_stream)
 
-    with _raw_terminal(input_stream):
+    with _raw_terminal(input_stream), _live_screen(output_stream, use_screen):
         while True:
             _render_wizard_menu(
                 step_label=step_label,
@@ -1091,8 +1138,7 @@ def _render_wizard_menu(
     output_stream,
     clear_screen: bool,
 ) -> None:
-    if clear_screen:
-        output_stream.write("\033[2J\033[H")
+    _clear_live_screen(output_stream, clear_screen)
     output_stream.write("dbx start launch wizard\n")
     output_stream.write(f"{step_label}\n")
     output_stream.write("Use ↑/↓ to choose, Enter to continue, q to cancel.\n\n")
@@ -1106,6 +1152,27 @@ def _render_wizard_menu(
         for line in body_lines:
             output_stream.write(f"{line}\n")
     output_stream.flush()
+
+
+def _clear_live_screen(output_stream, clear_screen: bool) -> None:
+    if clear_screen:
+        output_stream.write(ALT_SCREEN_ENTER)
+        output_stream.write(CLEAR_SCREEN)
+
+
+@contextmanager
+def _live_screen(output_stream, enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    output_stream.write(ALT_SCREEN_ENTER)
+    output_stream.flush()
+    try:
+        yield
+    finally:
+        output_stream.write(ALT_SCREEN_EXIT)
+        output_stream.flush()
 
 
 @contextmanager
@@ -1122,6 +1189,17 @@ def _raw_terminal(input_stream):
         yield
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
+def _read_monitor_key(input_stream, interval_seconds: float) -> str | None:
+    try:
+        readable, _, _ = select.select([input_stream], [], [], interval_seconds)
+    except (OSError, ValueError):
+        time.sleep(interval_seconds)
+        return None
+    if not readable:
+        return None
+    return _read_picker_key(input_stream)
 
 
 def _read_picker_key(input_stream) -> str:
@@ -1296,6 +1374,96 @@ def run_attach(config: AppConfig, job_id: str, *, check: bool = False) -> int:
         return 0
     print(" ".join(shlex_quote(part) for part in command))
     return 0
+
+
+def run_monitor(
+    config: AppConfig,
+    job_id: str,
+    *,
+    interval_seconds: float = DEFAULT_MONITOR_INTERVAL_SECONDS,
+    lines: int = DEFAULT_MONITOR_LOG_LINES,
+    once: bool = False,
+    input_stream=None,
+    output_stream=None,
+) -> int:
+    input_stream = input_stream or sys.stdin
+    output_stream = output_stream or sys.stdout
+    instance = describe_instance(config, job_id)
+    job_state = _load_or_infer_job_state(config, instance, job_id)
+    target = build_ssh_target(config, instance)
+    live = _stream_is_tty(input_stream) and _stream_is_tty(output_stream) and not once
+    if not _stream_is_tty(input_stream):
+        once = True
+
+    try:
+        with _raw_terminal(input_stream), _live_screen(output_stream, live):
+            while True:
+                git_status, codex_log = _monitor_remote_snapshot(
+                    target,
+                    job_state,
+                    lines=lines,
+                )
+                _render_monitor_snapshot(
+                    job_id=job_id,
+                    git_status=git_status,
+                    codex_log=codex_log,
+                    output_stream=output_stream,
+                    clear_screen=live,
+                    lines=lines,
+                    interval_seconds=interval_seconds,
+                )
+                if once:
+                    return 0
+                key = _read_monitor_key(input_stream, interval_seconds)
+                if key in {"q", "Q", "escape"}:
+                    return 0
+    except KeyboardInterrupt:
+        return 0
+
+
+def _monitor_remote_snapshot(
+    target: str,
+    job_state: JobState,
+    *,
+    lines: int,
+) -> tuple[str, str]:
+    paths = _remote_paths(job_state)
+    git_status = run_remote_shell_command(
+        target,
+        f"cd {shlex.quote(paths['repo_dir'])} && git status --short --branch",
+    ).stdout
+    codex_log = run_remote_shell_command(
+        target,
+        f"tail -n {int(lines)} {shlex.quote(paths['codex_log'])}",
+    ).stdout
+    return git_status, codex_log
+
+
+def _render_monitor_snapshot(
+    *,
+    job_id: str,
+    git_status: str,
+    codex_log: str,
+    output_stream,
+    clear_screen: bool,
+    lines: int,
+    interval_seconds: float,
+) -> None:
+    if clear_screen:
+        output_stream.write(ALT_SCREEN_ENTER)
+        output_stream.write(CLEAR_SCREEN)
+    output_stream.write(f"dbx monitor {job_id}\n")
+    output_stream.write(f"Refresh: {interval_seconds:g}s | Codex log lines: {lines}\n")
+    output_stream.write("Press q to quit.\n\n")
+    output_stream.write("Git\n")
+    output_stream.write(git_status or "(no git status output)\n")
+    if git_status and not git_status.endswith("\n"):
+        output_stream.write("\n")
+    output_stream.write("\nCodex output\n")
+    output_stream.write(codex_log or "(no Codex output)\n")
+    if codex_log and not codex_log.endswith("\n"):
+        output_stream.write("\n")
+    output_stream.flush()
 
 
 def run_finish(
@@ -1526,6 +1694,52 @@ def _capture_remote_artifacts(
         artifacts["codex_log"] = _tail_remote_text(target, paths["codex_log"])
         artifacts["finish_log"] = _tail_remote_text(target, paths["finish_log"], optional=True)
     return artifacts
+
+
+def _monitor_remote_snapshot(
+    target: str,
+    job_state: JobState,
+    *,
+    lines: int,
+) -> tuple[str, str]:
+    paths = _remote_paths(job_state)
+    return (
+        _remote_git_status(target, paths["repo_dir"]),
+        _tail_remote_text(target, paths["codex_log"], optional=True, lines=lines)
+        or "(codex log is not available yet)\n",
+    )
+
+
+def _remote_git_status(target: str, repo_dir: str) -> str:
+    try:
+        return _read_remote_command_output(
+            target,
+            f"cd {shlex.quote(repo_dir)} && git status --short --branch",
+        )
+    except RemoteCommandError as exc:
+        return f"(git status is not available yet: {exc})\n"
+
+
+def _render_monitor_snapshot(
+    *,
+    job_id: str,
+    git_status: str,
+    codex_log: str,
+    output_stream,
+    clear_screen: bool,
+    lines: int,
+    interval_seconds: float,
+) -> None:
+    _clear_live_screen(output_stream, clear_screen)
+    output_stream.write(f"dbx monitor {job_id}\n")
+    output_stream.write(f"Refreshing every {interval_seconds:g}s. q/Ctrl-C exits.\n\n")
+    output_stream.write("Git\n")
+    output_stream.write(git_status.rstrip() or "(clean)")
+    output_stream.write("\n\n")
+    output_stream.write(f"Codex output (last {lines} lines)\n")
+    output_stream.write(codex_log.rstrip() or "(no codex output yet)")
+    output_stream.write("\n")
+    output_stream.flush()
 
 
 def _persist_remote_artifacts(job_id: str, artifacts: dict[str, object]) -> None:

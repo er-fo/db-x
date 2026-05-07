@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -819,18 +820,19 @@ class CliTests(unittest.TestCase):
                                 "dbx.cli._run_finish_remote",
                                 return_value={"pr_url": "https://github.com/er-fo/db-x/pull/1"},
                             ):
-                                with patch(
-                                    "dbx.cli._terminate_job",
-                                    return_value={"final_state": "terminated"},
-                                ) as terminate_job:
+                                with patch("dbx.cli._persist_remote_artifacts"):
                                     with patch(
-                                        "dbx.cli.save_job_state",
-                                        side_effect=saved_jobs.append,
-                                    ):
-                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
-                                            exit_code = cli.main(
-                                                ["--config", str(config_path), "finish", "i-123"]
-                                            )
+                                        "dbx.cli._terminate_job",
+                                        return_value={"final_state": "terminated"},
+                                    ) as terminate_job:
+                                        with patch(
+                                            "dbx.cli.save_job_state",
+                                            side_effect=saved_jobs.append,
+                                        ):
+                                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                                exit_code = cli.main(
+                                                    ["--config", str(config_path), "finish", "i-123"]
+                                                )
 
         self.assertEqual(exit_code, 0)
         terminate_job.assert_called_once()
@@ -875,15 +877,150 @@ class CliTests(unittest.TestCase):
                                     "finish_log": "finish\n",
                                 },
                             ):
-                                with patch("sys.stdout", new=io.StringIO()) as stdout:
-                                    exit_code = cli.main(
-                                        ["--config", str(config_path), "status", "i-123", "--logs"]
-                                    )
+                                with patch("dbx.cli._persist_remote_artifacts"):
+                                    with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                        exit_code = cli.main(
+                                            ["--config", str(config_path), "status", "i-123", "--logs"]
+                                        )
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["remote_status"]["state"], "ready")
         self.assertEqual(payload["logs"]["codex"], "codex\n")
+
+    def test_monitor_once_shows_only_git_status_and_codex_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+
+            def fake_remote_command(target: str, shell_command: str, **kwargs):
+                if "git status --short --branch" in shell_command:
+                    return subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout="## agent/test...origin/main\n M src/dbx/cli.py\n",
+                        stderr="",
+                    )
+                if "tail -n 80" in shell_command and "logs/codex.log" in shell_command:
+                    return subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout="codex line 1\ncodex line 2\n",
+                        stderr="",
+                    )
+                raise AssertionError(f"unexpected remote command: {shell_command}")
+
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli._load_or_infer_job_state",
+                    return_value=_sample_job_state(),
+                ):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch(
+                            "dbx.cli.run_remote_shell_command",
+                            side_effect=fake_remote_command,
+                        ):
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                exit_code = cli.main(
+                                    ["--config", str(config_path), "monitor", "i-123", "--once"]
+                                )
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("Git", output)
+        self.assertIn("## agent/test...origin/main", output)
+        self.assertIn(" M src/dbx/cli.py", output)
+        self.assertIn("Codex output", output)
+        self.assertIn("codex line 2", output)
+        self.assertNotIn("STATUS.md", output)
+        self.assertNotIn("bootstrap", output)
+
+    def test_start_monitor_launches_then_monitors_on_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            with patch(
+                "dbx.cli.launch_instance",
+                return_value={"Instances": [{"InstanceId": "i-123"}]},
+            ):
+                with patch(
+                    "dbx.cli._wait_for_runtime_ready",
+                    return_value={"phase": "runtime", "state": "ready"},
+                ):
+                    with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
+                        with patch("dbx.cli.run_monitor", return_value=0) as monitor:
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                with patch("sys.stderr", new=io.StringIO()) as stderr:
+                                    exit_code = cli.main(
+                                        [
+                                            "--config",
+                                            str(config_path),
+                                            "start",
+                                            "er-fo/db-x",
+                                            str(mission_path),
+                                            "--monitor",
+                                        ]
+                                    )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["instance_id"], "i-123")
+        self.assertEqual(stderr.getvalue(), "")
+        monitor.assert_called_once()
+        self.assertEqual(monitor.call_args.args[1], "i-123")
+        self.assertIs(monitor.call_args.kwargs["output_stream"], stderr)
+        self.assertTrue(saved_jobs)
+
+    def test_start_monitor_requires_runtime_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch("sys.stderr", new=io.StringIO()) as stderr:
+                exit_code = cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "start",
+                        "er-fo/db-x",
+                        str(mission_path),
+                        "--no-wait",
+                        "--monitor",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("--monitor requires runtime verification", stderr.getvalue())
+
+    def test_live_render_uses_alternate_screen_sequences_when_clearing(self) -> None:
+        output = io.StringIO()
+
+        cli._render_monitor_snapshot(
+            job_id="i-123",
+            git_status="## main\n",
+            codex_log="codex\n",
+            output_stream=output,
+            clear_screen=True,
+            lines=80,
+            interval_seconds=2.0,
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("\033[?1049h", rendered)
+        self.assertIn("\033[2J\033[H", rendered)
+        self.assertIn("Git", rendered)
+        self.assertIn("Codex output", rendered)
 
     def test_wait_for_runtime_ready_reports_but_does_not_block_on_ec2_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1029,15 +1166,16 @@ class CliTests(unittest.TestCase):
                                             "dbx.cli.wait_for_instance_terminated",
                                             return_value={"State": {"Name": "terminated"}},
                                         ):
-                                            with patch("sys.stdout", new=io.StringIO()):
-                                                exit_code = cli.main(
-                                                    [
-                                                        "--config",
-                                                        str(config_path),
-                                                        "terminate",
-                                                        "i-123",
-                                                    ]
-                                                )
+                                            with patch("dbx.cli.save_job_state"):
+                                                with patch("sys.stdout", new=io.StringIO()):
+                                                    exit_code = cli.main(
+                                                        [
+                                                            "--config",
+                                                            str(config_path),
+                                                            "terminate",
+                                                            "i-123",
+                                                        ]
+                                                    )
 
         self.assertEqual(exit_code, 0)
         terminate_instance.assert_called_once()

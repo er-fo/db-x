@@ -32,6 +32,7 @@ dbx init-config
 dbx doctor
 dbx sessions
 dbx start
+dbx start --monitor
 dbx start er-fo/db-x missions/bootstrap.md
 dbx start er-fo/db-x missions/bootstrap.md --pick-session
 dbx list
@@ -39,6 +40,7 @@ dbx status i-0123456789abcdef0
 dbx status i-0123456789abcdef0 --logs
 dbx attach i-0123456789abcdef0
 dbx attach i-0123456789abcdef0 --check
+dbx monitor i-0123456789abcdef0
 dbx finish i-0123456789abcdef0
 dbx terminate i-0123456789abcdef0
 ```
@@ -56,6 +58,12 @@ time, branch, full session path, and latest user message. Subagent sessions are
 excluded, so the list shows direct user-submitted conversations.
 `dbx start <repo> <mission>` and `--resume-session <session-id>` remain
 available for scripted launches.
+
+Use `dbx start --monitor` to launch and immediately watch the devbox's live
+work. Use `dbx monitor <instance-id>` to attach the same focused monitor later.
+The monitor intentionally shows only remote `git status --short --branch` and
+the latest Codex output from `logs/codex.log`; it does not include cloud-init,
+finish, or status artifacts.
 
 `dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
 
