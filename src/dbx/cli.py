@@ -1626,9 +1626,15 @@ def run_finish(
     target = build_ssh_target(config, instance)
     artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
     _persist_remote_artifacts(job_id, artifacts)
-    blocked = bool(artifacts.get("blocker")) or _artifact_state_is_blocked(artifacts)
-    if _runtime_issue_from_artifacts(artifacts) is not None:
-        blocked = True
+    runtime_issue = _runtime_issue_from_artifacts(artifacts) or _runtime_issue_from_job_state(
+        job_state
+    )
+    blocked = (
+        job_state.status in REMOTE_NON_SUCCESS_STATES
+        or bool(artifacts.get("blocker"))
+        or _artifact_state_is_blocked(artifacts)
+        or runtime_issue is not None
+    )
 
     finish_result = _run_finish_remote(
         target,
@@ -1639,13 +1645,26 @@ def run_finish(
     )
     artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
     _persist_remote_artifacts(job_id, artifacts)
+    runtime_issue = runtime_issue or _runtime_issue_from_artifacts(artifacts)
+
+    updated_status = "preserved"
+    updated_last_error = None
+    if runtime_issue is not None:
+        updated_status = runtime_issue["status"]
+        updated_last_error = runtime_issue["detail"]
+    elif job_state.status in REMOTE_NON_SUCCESS_STATES:
+        updated_status = job_state.status
+        updated_last_error = job_state.last_error
+    elif blocked:
+        updated_status = "blocked"
+        updated_last_error = job_state.last_error
 
     updated_state = replace(
         job_state,
         lifecycle_state="preserved",
-        status="blocked" if blocked else "preserved",
+        status=updated_status,
         pr_url=finish_result.get("pr_url"),
-        last_error=None,
+        last_error=updated_last_error,
     )
     save_job_state(updated_state)
 
@@ -1953,16 +1972,16 @@ def _capture_remote_artifacts(
         "blocker",
         lambda: _read_remote_text(target, paths["blocker"], optional=True),
     )
+    artifacts["codex_log"] = _capture_artifact(
+        artifacts,
+        "codex_log",
+        lambda: _tail_remote_text(target, paths["codex_log"], optional=not include_logs),
+    )
     if include_logs:
         artifacts["bootstrap_log"] = _capture_artifact(
             artifacts,
             "bootstrap_log",
             lambda: _tail_remote_text(target, paths["bootstrap_log"]),
-        )
-        artifacts["codex_log"] = _capture_artifact(
-            artifacts,
-            "codex_log",
-            lambda: _tail_remote_text(target, paths["codex_log"]),
         )
         artifacts["finish_log"] = _capture_artifact(
             artifacts,
@@ -2321,6 +2340,15 @@ def _runtime_issue_from_artifacts(artifacts: dict[str, object]) -> dict[str, str
     if not isinstance(codex_log, str):
         return None
     return _runtime_issue_from_codex_log(codex_log)
+
+
+def _runtime_issue_from_job_state(job_state: JobState) -> dict[str, str] | None:
+    if job_state.status != "auth_failed":
+        return None
+    return {
+        "status": "auth_failed",
+        "detail": job_state.last_error or "codex_auth_failed",
+    }
 
 
 def _apply_runtime_issue_to_job_state(
