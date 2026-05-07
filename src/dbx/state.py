@@ -46,6 +46,7 @@ def save_job_artifact(
     root = (artifacts_dir or DEFAULT_ARTIFACTS_DIR).expanduser() / instance_id
     root.mkdir(parents=True, exist_ok=True)
     path = root / artifact_name
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -64,6 +65,35 @@ def load_job_state(instance_id: str, state_dir: Path | None = None) -> JobState 
     payload.setdefault("last_error", None)
     payload.setdefault("terminated_at", None)
     return JobState(**payload)
+
+
+def list_job_states(state_dir: Path | None = None) -> list[JobState]:
+    root = (state_dir or DEFAULT_STATE_DIR).expanduser()
+    if not root.exists():
+        return []
+    jobs: list[JobState] = []
+    for path in sorted(root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.setdefault("job_root", "")
+        payload.setdefault("lifecycle_state", "created")
+        payload.setdefault("status", "pending")
+        payload.setdefault("resume_session_id", None)
+        payload.setdefault("pr_url", None)
+        payload.setdefault("last_error", None)
+        payload.setdefault("terminated_at", None)
+        jobs.append(JobState(**payload))
+    return jobs
+
+
+def load_job_artifacts(instance_id: str, artifacts_dir: Path | None = None) -> dict[str, str]:
+    root = (artifacts_dir or DEFAULT_ARTIFACTS_DIR).expanduser() / instance_id
+    if not root.exists():
+        return {}
+    artifacts: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            artifacts[path.relative_to(root).as_posix()] = path.read_text(encoding="utf-8")
+    return artifacts
 
 
 def created_at_now() -> str:
