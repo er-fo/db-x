@@ -20,6 +20,10 @@ instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_domain = "tail12345.ts.net"
 tailscale_auth_key = "tskey-auth-xxxxxxxx"
+# Optional: bootstrap Codex auth non-interactively when present.
+# Prefer environment variables for secrets in day-to-day use.
+# codex_api_key = "sk-proj-xxxxxxxx"
+# codex_agent_identity = "agent-identity-token"
 tailscale_tags = ["tag:dbx"]
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
@@ -41,6 +45,8 @@ class AppConfig:
     ssh_user: str
     tailscale_domain: str | None
     tailscale_auth_key: str | None
+    codex_api_key: str | None
+    codex_agent_identity: str | None
     tailscale_tags: tuple[str, ...]
     repo_root: str
     job_prefix: str
@@ -84,6 +90,12 @@ def load_config(explicit_path: str | None = None) -> AppConfig:
         tailscale_domain=_optional_str(data.get("tailscale_domain")),
         tailscale_auth_key=_optional_str(
             os.environ.get("DBX_TAILSCALE_AUTH_KEY", data.get("tailscale_auth_key"))
+        ),
+        codex_api_key=_optional_str(
+            os.environ.get("DBX_OPENAI_API_KEY", data.get("codex_api_key"))
+        ),
+        codex_agent_identity=_optional_str(
+            os.environ.get("DBX_CODEX_AGENT_IDENTITY", data.get("codex_agent_identity"))
         ),
         tailscale_tags=_optional_str_list(data.get("tailscale_tags")),
         repo_root=_required_str(data, "repo_root"),

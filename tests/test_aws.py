@@ -133,7 +133,7 @@ class AwsTests(unittest.TestCase):
         self.assertIn("codex_auth_failed", script)
         self.assertIn("[projects.", script)
         self.assertIn("trust_level = \"trusted\"", script)
-        self.assertIn("sudo -u \"$DBX_USER\" -H tmux new-session", script)
+        self.assertIn("tmux new-session -d -s \"$SESSION_NAME\" -c \"$REPO_DIR\"", script)
         self.assertIn("tmux pipe-pane -o", script)
         self.assertNotIn("| tee '$LOG_FILE'", script)
 
@@ -154,7 +154,7 @@ class AwsTests(unittest.TestCase):
 
             script = build_user_data(config, request)
 
-        self.assertIn('write_status "runtime" "starting" "waiting_for_agent_heartbeat"', script)
+        self.assertIn('write_runtime_status "runtime" "starting" "waiting_for_agent_heartbeat"', script)
         self.assertNotIn('write_status "runtime" "ready" "tmux session started"', script)
         self.assertIn(
             "Your first action is mandatory: write /home/ubuntu/work/dbx-ship-123/AGENT_STARTED.json before reading AGENT_MISSION.md or running any repository command.",
@@ -254,8 +254,14 @@ class AwsTests(unittest.TestCase):
         self.assertIn("/usr/local/bin/dbx-finish-ready", script)
         self.assertIn("/usr/local/bin/dbx-finish-job", script)
         self.assertIn("/usr/local/bin/dbx-codex-watch", script)
+        self.assertIn("/usr/local/bin/dbx-codex-auth-bootstrap", script)
         self.assertIn("/usr/local/bin/dbx-codex-preflight", script)
+        self.assertIn("/usr/local/bin/dbx-start-runtime", script)
+        self.assertIn("/usr/local/bin/dbx-auth-recover", script)
         self.assertIn("/usr/local/bin/dbx-preflight-hook", script)
+        self.assertIn("codex login --with-api-key", script)
+        self.assertIn("codex login --with-agent-identity", script)
+        self.assertIn("codex login --device-auth", script)
         self.assertIn("codex_hooks = true", script)
         self.assertIn("hooks.json", script)
         self.assertIn('"hooks": {', script)
@@ -277,7 +283,7 @@ class AwsTests(unittest.TestCase):
         self.assertIn("DBX_FINISH_DONE", script)
         self.assertLess(
             script.index("/usr/local/bin/dbx-codex-preflight"),
-            script.index("sudo -u \"$DBX_USER\" -H tmux new-session"),
+            script.index('sudo -u "$DBX_USER" -H /usr/local/bin/dbx-start-runtime'),
         )
 
     def test_build_user_data_remote_watcher_marks_codex_auth_failure_blocked(self) -> None:
@@ -337,6 +343,8 @@ class AwsTests(unittest.TestCase):
         self.assertIn("trap - ERR", script)
         self.assertIn("write_preflight_status()", script)
         self.assertIn("redact_preflight_tail()", script)
+        self.assertIn("/usr/local/bin/dbx-auth-recover", script)
+        self.assertIn("Run /usr/local/bin/dbx-auth-recover after signing in.", script)
 
 
 def _sample_config() -> str:

@@ -31,6 +31,8 @@ instance_type = "c7i.xlarge"
 ssh_user = "ubuntu"
 tailscale_domain = "tailnet.ts.net"
 tailscale_auth_key = "tskey-auth-123"
+codex_api_key = "sk-proj-config"
+codex_agent_identity = "agent-identity-config"
 tailscale_tags = ["tag:dbx"]
 repo_root = "/home/ubuntu/work"
 job_prefix = "dbx"
@@ -45,6 +47,8 @@ job_prefix = "dbx"
         self.assertEqual(config.default_mission, "/tmp/mission.md")
         self.assertEqual(config.tailscale_domain, "tailnet.ts.net")
         self.assertEqual(config.tailscale_auth_key, "tskey-auth-123")
+        self.assertEqual(config.codex_api_key, "sk-proj-config")
+        self.assertEqual(config.codex_agent_identity, "agent-identity-config")
         self.assertEqual(config.tailscale_tags, ("tag:dbx",))
 
     def test_load_config_prefers_env_tailscale_auth_key(self) -> None:
@@ -71,6 +75,38 @@ job_prefix = "dbx"
                 config = load_config(str(config_path))
 
         self.assertEqual(config.tailscale_auth_key, "tskey-auth-env")
+
+    def test_load_config_prefers_env_codex_auth_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                """
+aws_region = "eu-north-1"
+default_owner = "er-fo"
+default_base_branch = "main"
+ami_id = "ami-123"
+subnet_id = "subnet-123"
+security_group_id = "sg-123"
+instance_type = "c7i.xlarge"
+ssh_user = "ubuntu"
+codex_api_key = "sk-proj-config"
+codex_agent_identity = "agent-identity-config"
+repo_root = "/home/ubuntu/work"
+job_prefix = "dbx"
+""",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "DBX_OPENAI_API_KEY": "sk-proj-env",
+                    "DBX_CODEX_AGENT_IDENTITY": "agent-identity-env",
+                },
+            ):
+                config = load_config(str(config_path))
+
+        self.assertEqual(config.codex_api_key, "sk-proj-env")
+        self.assertEqual(config.codex_agent_identity, "agent-identity-env")
 
 
 if __name__ == "__main__":

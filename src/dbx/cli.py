@@ -595,6 +595,32 @@ def run_start(
             )
             save_job_state(job_state)
         except RuntimeLifecycleError as exc:
+            recovery = _recoverable_start_recovery(config, job_state, exc)
+            if recovery is not None:
+                blocked_state = replace(
+                    job_state,
+                    lifecycle_state="blocked",
+                    status=exc.status,
+                    last_error=exc.detail,
+                )
+                save_job_state(blocked_state)
+                _print_json(
+                    _build_start_failure_output(
+                        blocked_state,
+                        status=exc.status,
+                        detail=exc.detail,
+                        lifecycle_state="blocked",
+                        termination=None,
+                        resume_session_upload=resume_session_upload,
+                        artifacts=(
+                            exc.runtime.get("artifacts")
+                            if isinstance(exc.runtime.get("artifacts"), dict)
+                            else {}
+                        ),
+                        recovery=recovery,
+                    )
+                )
+                return 1
             lifecycle_state, termination = _terminate_after_start_failure(
                 config,
                 job_state,
@@ -642,6 +668,34 @@ def _classify_resume_upload_failure(exc: AwsCliError) -> tuple[str, str]:
     return status, detail
 
 
+def _recoverable_start_recovery(
+    config: AppConfig,
+    job_state: JobState,
+    exc: RuntimeLifecycleError,
+) -> dict[str, object] | None:
+    if exc.detail not in {
+        "codex_auth_failed",
+        "codex_login_required",
+        "codex_auth_bootstrap_failed",
+    }:
+        return None
+    runtime = exc.runtime if isinstance(exc.runtime, dict) else {}
+    artifacts = runtime.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return None
+    status_json = artifacts.get("status_json")
+    if not isinstance(status_json, dict) or str(status_json.get("phase")) != "bootstrap":
+        return None
+    ssh_target = runtime.get("ssh_target")
+    if not isinstance(ssh_target, str) or not ssh_target:
+        ssh_target = f"{config.ssh_user}@{job_state.job_name}"
+    return {
+        "mode": "device_auth",
+        "ssh_target": ssh_target,
+        "command": f"ssh {ssh_target} /usr/local/bin/dbx-auth-recover",
+    }
+
+
 def _terminate_after_start_failure(
     config: AppConfig,
     job_state: JobState,
@@ -679,9 +733,10 @@ def _build_start_failure_output(
     status: str,
     detail: str,
     lifecycle_state: str,
-    termination: dict[str, object],
+    termination: dict[str, object] | None,
     resume_session_upload: dict[str, object] | None = None,
     artifacts: dict[str, object] | None = None,
+    recovery: dict[str, object] | None = None,
 ) -> dict[str, object]:
     output = {
         "job_name": job_state.job_name,
@@ -692,12 +747,15 @@ def _build_start_failure_output(
         "status": status,
         "detail": detail,
         "lifecycle_state": lifecycle_state,
-        "termination": termination,
     }
+    if termination is not None:
+        output["termination"] = termination
     if resume_session_upload is not None:
         output["resume_session_upload"] = resume_session_upload
     if artifacts:
         output["artifacts"] = _artifact_excerpts(artifacts)
+    if recovery is not None:
+        output["recovery"] = recovery
     return output
 
 

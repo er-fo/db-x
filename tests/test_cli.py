@@ -1944,6 +1944,65 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["detail"], "codex_auth_failed")
         self.assertEqual(payload["termination"]["final_state"], "terminated")
 
+    def test_start_preserves_recoverable_bootstrap_auth_block_for_manual_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            saved_jobs = []
+            with patch(
+                "dbx.cli.launch_instance",
+                return_value={"Instances": [{"InstanceId": "i-123"}]},
+            ):
+                with patch(
+                    "dbx.cli._wait_for_runtime_ready",
+                    side_effect=cli.RuntimeLifecycleError(
+                        status="blocked",
+                        detail="codex_auth_failed",
+                        runtime={
+                            "status": "blocked",
+                            "detail": "codex_auth_failed",
+                            "ssh_target": "ubuntu@dbx-job",
+                            "artifacts": {
+                                "status_json": {
+                                    "phase": "bootstrap",
+                                    "state": "blocked",
+                                    "detail": "codex_auth_failed",
+                                },
+                                "blocker": "# Codex authentication failed\n",
+                            },
+                        },
+                    ),
+                ):
+                    with patch("dbx.cli._terminate_job") as terminate_job:
+                        with patch(
+                            "dbx.cli.save_job_state",
+                            side_effect=saved_jobs.append,
+                        ):
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                exit_code = cli.main(
+                                    [
+                                        "--config",
+                                        str(config_path),
+                                        "start",
+                                        "er-fo/db-x",
+                                        str(mission_path),
+                                    ]
+                                )
+
+        self.assertEqual(exit_code, 1)
+        terminate_job.assert_not_called()
+        self.assertEqual(saved_jobs[-1].lifecycle_state, "blocked")
+        self.assertEqual(saved_jobs[-1].status, "blocked")
+        self.assertEqual(saved_jobs[-1].last_error, "codex_auth_failed")
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["lifecycle_state"], "blocked")
+        self.assertEqual(payload["recovery"]["mode"], "device_auth")
+        self.assertIn("/usr/local/bin/dbx-auth-recover", payload["recovery"]["command"])
+        self.assertEqual(payload["recovery"]["ssh_target"], "ubuntu@dbx-job")
+
     def test_start_terminates_on_auth_failed_runtime_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
