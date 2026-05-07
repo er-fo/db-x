@@ -809,18 +809,19 @@ class CliTests(unittest.TestCase):
                             "dbx.cli._terminate_job",
                             return_value={"final_state": "terminated"},
                         ) as terminate_job:
-                            with patch("sys.stdout", new=io.StringIO()) as stdout:
-                                exit_code = cli.main(
-                                    [
-                                        "--config",
-                                        str(config_path),
-                                        "start",
-                                        "--resume-session",
-                                        "019dfdac-5bea-71f0-91c5-4fdd8826860b",
-                                        "er-fo/db-x",
-                                        str(mission_path),
-                                    ]
-                                )
+                            with patch("dbx.cli.save_job_state"):
+                                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                    exit_code = cli.main(
+                                        [
+                                            "--config",
+                                            str(config_path),
+                                            "start",
+                                            "--resume-session",
+                                            "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                                            "er-fo/db-x",
+                                            str(mission_path),
+                                        ]
+                                    )
 
         self.assertEqual(exit_code, 1)
         terminate_job.assert_called_once()
@@ -1445,16 +1446,17 @@ class CliTests(unittest.TestCase):
                         "dbx.cli._terminate_job",
                         return_value={"final_state": "terminated"},
                     ) as terminate_job:
-                        with patch("sys.stdout", new=io.StringIO()) as stdout:
-                            exit_code = cli.main(
-                                [
-                                    "--config",
-                                    str(config_path),
-                                    "start",
-                                    "er-fo/db-x",
-                                    str(mission_path),
-                                ]
-                            )
+                        with patch("dbx.cli.save_job_state"):
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                exit_code = cli.main(
+                                    [
+                                        "--config",
+                                        str(config_path),
+                                        "start",
+                                        "er-fo/db-x",
+                                        str(mission_path),
+                                    ]
+                                )
 
         self.assertEqual(exit_code, 1)
         terminate_job.assert_called_once()
@@ -1489,16 +1491,17 @@ class CliTests(unittest.TestCase):
                         "dbx.cli._terminate_job",
                         return_value={"final_state": "terminated"},
                     ):
-                        with patch("sys.stdout", new=io.StringIO()) as stdout:
-                            exit_code = cli.main(
-                                [
-                                    "--config",
-                                    str(config_path),
-                                    "start",
-                                    "er-fo/db-x",
-                                    str(mission_path),
-                                ]
-                            )
+                        with patch("dbx.cli.save_job_state"):
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                exit_code = cli.main(
+                                    [
+                                        "--config",
+                                        str(config_path),
+                                        "start",
+                                        "er-fo/db-x",
+                                        str(mission_path),
+                                    ]
+                                )
 
         self.assertEqual(exit_code, 1)
         payload = json.loads(stdout.getvalue())
@@ -1531,16 +1534,17 @@ class CliTests(unittest.TestCase):
                         "dbx.cli._terminate_job",
                         return_value={"final_state": "terminated"},
                     ):
-                        with patch("sys.stdout", new=io.StringIO()) as stdout:
-                            exit_code = cli.main(
-                                [
-                                    "--config",
-                                    str(config_path),
-                                    "start",
-                                    "er-fo/db-x",
-                                    str(mission_path),
-                                ]
-                            )
+                        with patch("dbx.cli.save_job_state"):
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                exit_code = cli.main(
+                                    [
+                                        "--config",
+                                        str(config_path),
+                                        "start",
+                                        "er-fo/db-x",
+                                        str(mission_path),
+                                    ]
+                                )
 
         self.assertEqual(exit_code, 1)
         payload = json.loads(stdout.getvalue())
