@@ -1421,51 +1421,6 @@ def run_monitor(
         return 0
 
 
-def _monitor_remote_snapshot(
-    target: str,
-    job_state: JobState,
-    *,
-    lines: int,
-) -> tuple[str, str]:
-    paths = _remote_paths(job_state)
-    git_status = run_remote_shell_command(
-        target,
-        f"cd {shlex.quote(paths['repo_dir'])} && git status --short --branch",
-    ).stdout
-    codex_log = run_remote_shell_command(
-        target,
-        f"tail -n {int(lines)} {shlex.quote(paths['codex_log'])}",
-    ).stdout
-    return git_status, codex_log
-
-
-def _render_monitor_snapshot(
-    *,
-    job_id: str,
-    git_status: str,
-    codex_log: str,
-    output_stream,
-    clear_screen: bool,
-    lines: int,
-    interval_seconds: float,
-) -> None:
-    if clear_screen:
-        output_stream.write(ALT_SCREEN_ENTER)
-        output_stream.write(CLEAR_SCREEN)
-    output_stream.write(f"dbx monitor {job_id}\n")
-    output_stream.write(f"Refresh: {interval_seconds:g}s | Codex log lines: {lines}\n")
-    output_stream.write("Press q to quit.\n\n")
-    output_stream.write("Git\n")
-    output_stream.write(git_status or "(no git status output)\n")
-    if git_status and not git_status.endswith("\n"):
-        output_stream.write("\n")
-    output_stream.write("\nCodex output\n")
-    output_stream.write(codex_log or "(no Codex output)\n")
-    if codex_log and not codex_log.endswith("\n"):
-        output_stream.write("\n")
-    output_stream.flush()
-
-
 def run_finish(
     config: AppConfig,
     job_id: str,
