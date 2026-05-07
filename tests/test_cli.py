@@ -903,6 +903,67 @@ class CliTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["termination"]["final_state"], "terminated")
 
+    def test_finish_treats_codex_auth_failure_as_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            job_state = _sample_job_state()
+            ready_artifacts = {
+                "status_json": {
+                    "phase": "runtime",
+                    "state": "ready",
+                    "detail": "tmux session started",
+                },
+                "status_md": "# dbx-job\n",
+                "blocker": None,
+                "bootstrap_log": "boot\n",
+                "codex_log": (
+                    "Provided authentication token is expired. Please try signing in again.\n"
+                ),
+                "finish_log": None,
+            }
+            finished_artifacts = {
+                "status_json": {"phase": "finish", "state": "blocked", "detail": "blocked"},
+                "status_md": "# dbx-job\n",
+                "blocker": "Codex authentication failed.",
+                "bootstrap_log": "boot\n",
+                "codex_log": "Provided authentication token is expired.\n",
+                "finish_log": "finish\n",
+            }
+
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "PrivateDnsName": "dbx-job",
+                    "PrivateIpAddress": "10.0.0.1",
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch("dbx.cli._load_or_infer_job_state", return_value=job_state):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch(
+                            "dbx.cli._capture_remote_artifacts",
+                            side_effect=[ready_artifacts, finished_artifacts],
+                        ):
+                            with patch("dbx.cli._persist_remote_artifacts"):
+                                with patch(
+                                    "dbx.cli._run_finish_remote",
+                                    return_value={"pr_url": "https://github.com/er-fo/db-x/pull/1"},
+                                ) as run_finish_remote:
+                                    with patch(
+                                        "dbx.cli._terminate_job",
+                                        return_value={"final_state": "terminated"},
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()):
+                                            exit_code = cli.main(
+                                                ["--config", str(config_path), "finish", "i-123"]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(run_finish_remote.call_args.kwargs["blocked"])
+
     def test_finish_remote_delegates_to_vm_finish_script(self) -> None:
         job_state = _sample_job_state()
         with patch("dbx.cli.run_remote_shell_command") as run_remote:
@@ -972,6 +1033,76 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["remote_status"]["state"], "running")
         self.assertEqual(payload["logs"]["codex"], "codex\n")
 
+    def test_status_marks_auth_failed_when_codex_log_shows_auth_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            saved_jobs = []
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "PrivateDnsName": "dbx-job",
+                    "PrivateIpAddress": "10.0.0.1",
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli.load_job_state",
+                    return_value=_sample_job_state(),
+                ):
+                    with patch(
+                        "dbx.cli.describe_instance_status",
+                        return_value={
+                            "SystemStatus": {"Status": "ok"},
+                            "InstanceStatus": {"Status": "ok"},
+                        },
+                    ):
+                        with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                            with patch(
+                                "dbx.cli._capture_remote_artifacts",
+                                return_value={
+                                    "status_json": {
+                                        "phase": "runtime",
+                                        "state": "ready",
+                                        "detail": "tmux session started",
+                                    },
+                                    "status_md": "# dbx-job\n",
+                                    "blocker": None,
+                                    "bootstrap_log": "boot\n",
+                                    "codex_log": (
+                                        "Your access token could not be refreshed because your "
+                                        "refresh token was already used. Please log out and sign "
+                                        "in again.\n"
+                                    ),
+                                    "finish_log": "finish\n",
+                                },
+                            ):
+                                with patch("dbx.cli._persist_remote_artifacts"):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                            exit_code = cli.main(
+                                                [
+                                                    "--config",
+                                                    str(config_path),
+                                                    "status",
+                                                    "i-123",
+                                                    "--logs",
+                                                ]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "auth_failed")
+        self.assertEqual(payload["last_error"], "codex_auth_failed")
+        self.assertIn("Codex authentication failed", payload["blocker"])
+        self.assertEqual(saved_jobs[-1].status, "auth_failed")
+        self.assertEqual(saved_jobs[-1].last_error, "codex_auth_failed")
+
     def test_monitor_once_shows_only_git_status_and_codex_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
@@ -1025,6 +1156,65 @@ class CliTests(unittest.TestCase):
         self.assertIn("codex line 2", output)
         self.assertNotIn("STATUS.md", output)
         self.assertNotIn("bootstrap", output)
+
+    def test_monitor_marks_auth_failed_when_codex_log_shows_auth_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            saved_jobs = []
+
+            def fake_remote_command(target: str, shell_command: str, **kwargs):
+                if "git status --short --branch" in shell_command:
+                    return subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout="## agent/test...origin/main\n",
+                        stderr="",
+                    )
+                if "tail -n 80" in shell_command and "logs/codex.log" in shell_command:
+                    return subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout=(
+                            "Provided authentication token is expired. Please try signing in again.\n"
+                            "Your access token could not be refreshed because your refresh token "
+                            "was already used. Please log out and sign in again.\n"
+                        ),
+                        stderr="",
+                    )
+                raise AssertionError(f"unexpected remote command: {shell_command}")
+
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli._load_or_infer_job_state",
+                    return_value=_sample_job_state(),
+                ):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch(
+                            "dbx.cli.run_remote_shell_command",
+                            side_effect=fake_remote_command,
+                        ):
+                            with patch(
+                                "dbx.cli.save_job_state",
+                                side_effect=saved_jobs.append,
+                            ):
+                                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                    exit_code = cli.main(
+                                        ["--config", str(config_path), "monitor", "i-123", "--once"]
+                                    )
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn("Runtime issue: auth_failed (codex_auth_failed)", output)
+        self.assertEqual(saved_jobs[-1].status, "auth_failed")
+        self.assertEqual(saved_jobs[-1].last_error, "codex_auth_failed")
 
     def test_start_monitor_launches_then_monitors_on_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1094,6 +1284,7 @@ class CliTests(unittest.TestCase):
             job_id="i-123",
             git_status="## main\n",
             codex_log="codex\n",
+            runtime_issue=None,
             output_stream=output,
             clear_screen=True,
             lines=80,

@@ -117,6 +117,11 @@ _CODEX_AUTH_FAILURE_PATTERNS = (
     re.compile(r"not logged in", re.IGNORECASE),
     re.compile(r"login required", re.IGNORECASE),
     re.compile(r"invalid api key", re.IGNORECASE),
+    re.compile(r"token_expired", re.IGNORECASE),
+    re.compile(r"authentication token is expired", re.IGNORECASE),
+    re.compile(r"access token could not be refreshed", re.IGNORECASE),
+    re.compile(r"refresh token was already used", re.IGNORECASE),
+    re.compile(r"please log out and sign in again", re.IGNORECASE),
 )
 
 
@@ -1583,10 +1588,17 @@ def run_monitor(
                     job_state,
                     lines=lines,
                 )
+                runtime_issue = _runtime_issue_from_codex_log(codex_log)
+                if runtime_issue is not None:
+                    updated_state = _apply_runtime_issue_to_job_state(job_state, runtime_issue)
+                    if updated_state != job_state:
+                        save_job_state(updated_state)
+                        job_state = updated_state
                 _render_monitor_snapshot(
                     job_id=job_id,
                     git_status=git_status,
                     codex_log=codex_log,
+                    runtime_issue=runtime_issue,
                     output_stream=output_stream,
                     clear_screen=live,
                     lines=lines,
@@ -1615,6 +1627,8 @@ def run_finish(
     artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
     _persist_remote_artifacts(job_id, artifacts)
     blocked = bool(artifacts.get("blocker")) or _artifact_state_is_blocked(artifacts)
+    if _runtime_issue_from_artifacts(artifacts) is not None:
+        blocked = True
 
     finish_result = _run_finish_remote(
         target,
@@ -1850,6 +1864,15 @@ def _build_status_summary(
         summary["remote_status"] = artifacts.get("status_json")
         summary["status_markdown"] = artifacts.get("status_md")
         summary["blocker"] = artifacts.get("blocker")
+        runtime_issue = _runtime_issue_from_artifacts(artifacts)
+        if runtime_issue is not None:
+            summary["status"] = runtime_issue["status"]
+            summary["last_error"] = runtime_issue["detail"]
+            summary["runtime_issue"] = runtime_issue
+            summary["blocker"] = summary["blocker"] or runtime_issue["blocker"]
+            updated_state = _apply_runtime_issue_to_job_state(local_state, runtime_issue)
+            if updated_state != local_state:
+                save_job_state(updated_state)
         if isinstance(artifacts.get("errors"), dict) and artifacts["errors"]:
             summary["artifact_errors"] = artifacts["errors"]
         if include_logs:
@@ -1978,6 +2001,7 @@ def _render_monitor_snapshot(
     job_id: str,
     git_status: str,
     codex_log: str,
+    runtime_issue: dict[str, str] | None,
     output_stream,
     clear_screen: bool,
     lines: int,
@@ -1986,6 +2010,10 @@ def _render_monitor_snapshot(
     _clear_live_screen(output_stream, clear_screen)
     output_stream.write(f"dbx monitor {job_id}\n")
     output_stream.write(f"Refreshing every {interval_seconds:g}s. q/Ctrl-C exits.\n\n")
+    if runtime_issue is not None:
+        output_stream.write(
+            f"Runtime issue: {runtime_issue['status']} ({runtime_issue['detail']})\n\n"
+        )
     output_stream.write("Git\n")
     output_stream.write(git_status.rstrip() or "(clean)")
     output_stream.write("\n\n")
@@ -2161,7 +2189,7 @@ def _artifact_state_is_blocked(artifacts: dict[str, object]) -> bool:
     status_json = artifacts.get("status_json")
     if not isinstance(status_json, dict):
         return False
-    return str(status_json.get("state")) == "blocked"
+    return str(status_json.get("state")) in REMOTE_NON_SUCCESS_STATES
 
 
 def _console_output_excerpt(config: AppConfig, job_id: str, limit: int = 400) -> str:
@@ -2276,6 +2304,48 @@ def _best_effort_runtime_artifacts(
 
 def _log_has_codex_auth_failure(text: str) -> bool:
     return any(pattern.search(text) for pattern in _CODEX_AUTH_FAILURE_PATTERNS)
+
+
+def _runtime_issue_from_codex_log(codex_log: str | None) -> dict[str, str] | None:
+    if not isinstance(codex_log, str) or not _log_has_codex_auth_failure(codex_log):
+        return None
+    return {
+        "status": "auth_failed",
+        "detail": "codex_auth_failed",
+        "blocker": _codex_auth_failure_blocker(codex_log),
+    }
+
+
+def _runtime_issue_from_artifacts(artifacts: dict[str, object]) -> dict[str, str] | None:
+    codex_log = artifacts.get("codex_log")
+    if not isinstance(codex_log, str):
+        return None
+    return _runtime_issue_from_codex_log(codex_log)
+
+
+def _apply_runtime_issue_to_job_state(
+    job_state: JobState, runtime_issue: dict[str, str]
+) -> JobState:
+    return replace(
+        job_state,
+        status=runtime_issue["status"],
+        last_error=runtime_issue["detail"],
+    )
+
+
+def _codex_auth_failure_blocker(codex_log: str) -> str:
+    excerpt = _redact_text(codex_log.strip()) or "Codex reported an authentication failure."
+    return "\n".join(
+        [
+            "# Codex authentication failed",
+            "",
+            "dbx detected a Codex authentication failure after the runtime was marked ready.",
+            "",
+            "## codex.log tail",
+            excerpt,
+            "",
+        ]
+    )
 
 
 def _redact_text(text: str) -> str:
