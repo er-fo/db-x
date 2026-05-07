@@ -1677,6 +1677,25 @@ def _wait_for_runtime_ready(
             remote_status = _read_remote_json(target, paths["status_json"])
             remote_state = str(remote_status.get("state") or "")
             remote_detail = str(remote_status.get("detail") or "")
+            tmux_ready = _remote_tmux_session_exists(target, job_state.session_name)
+            codex_log_ready = False
+            if tmux_ready:
+                codex_log_ready = _remote_file_exists(target, paths["codex_log"])
+            if codex_log_ready:
+                codex_log = _tail_remote_text(target, paths["codex_log"], optional=True)
+                if isinstance(codex_log, str) and _log_has_codex_auth_failure(codex_log):
+                    artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
+                    _persist_remote_artifacts(job_state.instance_id, artifacts)
+                    raise RuntimeLifecycleError(
+                        status="auth_failed",
+                        detail="codex_auth_failed",
+                        runtime={
+                            "status": "auth_failed",
+                            "detail": "codex_auth_failed",
+                            "ssh_target": target,
+                            "artifacts": artifacts,
+                        },
+                    )
             if remote_state in REMOTE_NON_SUCCESS_STATES:
                 artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
                 _persist_remote_artifacts(job_state.instance_id, artifacts)
@@ -1700,32 +1719,17 @@ def _wait_for_runtime_ready(
                 time.sleep(poll_interval_seconds)
                 continue
 
-            if not _remote_tmux_session_exists(target, job_state.session_name):
+            if not tmux_ready:
                 last_problem = "tmux session is not ready"
                 last_detail = "tmux_session_not_ready"
                 time.sleep(poll_interval_seconds)
                 continue
 
-            if not _remote_file_exists(target, _remote_paths(job_state)["codex_log"]):
+            if not codex_log_ready:
                 last_problem = "codex log has not been created"
                 last_detail = "codex_log_missing"
                 time.sleep(poll_interval_seconds)
                 continue
-
-            codex_log = _tail_remote_text(target, paths["codex_log"], optional=True)
-            if isinstance(codex_log, str) and _log_has_codex_auth_failure(codex_log):
-                artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
-                _persist_remote_artifacts(job_state.instance_id, artifacts)
-                raise RuntimeLifecycleError(
-                    status="auth_failed",
-                    detail="codex_auth_failed",
-                    runtime={
-                        "status": "auth_failed",
-                        "detail": "codex_auth_failed",
-                        "ssh_target": target,
-                        "artifacts": artifacts,
-                    },
-                )
 
             if not _remote_file_exists(target, paths["agent_started_json"]):
                 last_problem = "agent heartbeat has not been written"

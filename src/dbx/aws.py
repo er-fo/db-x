@@ -62,7 +62,6 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     mission_text = request.mission_path.read_text(encoding="utf-8")
     mission_marker = "DBX_MISSION_EOF"
     prompt_marker = "DBX_PROMPT_EOF"
-    bootstrap_prompt = _build_bootstrap_prompt(request.session_name)
     repo_clone_url = f"https://github.com/{request.repo}.git"
     job_root = f"{config.repo_root.rstrip('/')}/{request.job_name}"
     repo_dir = f"{job_root}/repo"
@@ -70,6 +69,10 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     status_file = f"{job_root}/STATUS.md"
     status_json = f"{job_root}/status.json"
     agent_started_json = f"{job_root}/AGENT_STARTED.json"
+    bootstrap_prompt = _build_bootstrap_prompt(
+        request.session_name,
+        agent_started_json,
+    )
     blocker_file = f"{job_root}/BLOCKER.md"
     prompt_file = f"{job_root}/BOOTSTRAP_PROMPT.txt"
     log_dir = f"{job_root}/logs"
@@ -596,7 +599,7 @@ def _find_tag(instance: dict[str, object], key: str) -> str | None:
     return None
 
 
-def _build_bootstrap_prompt(session_name: str) -> str:
+def _build_bootstrap_prompt(session_name: str, agent_started_json: str) -> str:
     return "\n".join(
         [
             "Continue and complete the task you were doing previously.",
@@ -610,7 +613,7 @@ def _build_bootstrap_prompt(session_name: str) -> str:
             "- The instance is disposable; keep the git branch clean, reviewable, and resumable.",
             "- When you mark the work complete or blocked, dbx will preserve the branch, open or update a pull request, and terminate the VM after PR confirmation.",
             "",
-            "Read AGENT_MISSION.md before doing anything else.",
+            f"Your first action is mandatory: write {agent_started_json} before reading AGENT_MISSION.md or running any repository command.",
             "",
             "You are authorized to prepare this VM environment as needed:",
             "- inspect the repository and current git state",
@@ -629,16 +632,17 @@ def _build_bootstrap_prompt(session_name: str) -> str:
             "- before stopping, ensure the repository is clean or explicitly documented in STATUS.md",
             "",
             "Start by:",
-            "1. Reading AGENT_MISSION.md, then immediately writing AGENT_STARTED.json in the job root.",
+            f"1. Writing {agent_started_json}.",
             "   Use JSON with status, started_at, and session_name.",
             "   Set \"status\": \"running\" and use the current ISO-8601 UTC timestamp.",
             f"   Set \"session_name\": {json.dumps(session_name)}.",
-            "2. Updating status.json and STATUS.md to phase=runtime, state=running, detail=agent_heartbeat_received.",
-            "3. Inspecting the repository, mission file, and git status.",
-            "4. Writing a brief plan into STATUS.md or the nearest durable project artifact.",
-            "5. Continuing the task in coherent checkpoints.",
-            "6. Verifying each checkpoint before moving on.",
-            "7. Keeping the branch clean, reviewable, and resumable throughout the work.",
+            "2. Reading AGENT_MISSION.md.",
+            "3. Updating status.json and STATUS.md to phase=runtime, state=running, detail=agent_heartbeat_received.",
+            "4. Inspecting the repository, mission file, and git status.",
+            "5. Writing a brief plan into STATUS.md or the nearest durable project artifact.",
+            "6. Continuing the task in coherent checkpoints.",
+            "7. Verifying each checkpoint before moving on.",
+            "8. Keeping the branch clean, reviewable, and resumable throughout the work.",
             "",
             "When the work is complete and verified:",
             "- update STATUS.md with the result and verification evidence",
@@ -655,7 +659,7 @@ def _build_bootstrap_prompt(session_name: str) -> str:
             "",
             "If Codex exits before you mark complete or blocked, dbx treats the stop as unknown, preserves the branch in a draft PR, and terminates only after PR confirmation.",
             "",
-            "The first heartbeat step is mandatory: write AGENT_STARTED.json before any repository command.",
+            f"The first heartbeat step is mandatory: write {agent_started_json} before reading AGENT_MISSION.md or running any repository command.",
             "Never stop without leaving a clear status note and a clean or explicitly documented git state.",
         ]
     )

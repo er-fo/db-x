@@ -120,7 +120,15 @@ class AwsTests(unittest.TestCase):
 
         self.assertIn('write_status "runtime" "starting" "waiting_for_agent_heartbeat"', script)
         self.assertNotIn('write_status "runtime" "ready" "tmux session started"', script)
-        self.assertIn("write AGENT_STARTED.json", script)
+        self.assertIn(
+            "Your first action is mandatory: write /home/ubuntu/work/dbx-ship-123/AGENT_STARTED.json before reading AGENT_MISSION.md or running any repository command.",
+            script,
+        )
+        self.assertNotIn("Read AGENT_MISSION.md before doing anything else.", script)
+        self.assertNotIn(
+            "Reading AGENT_MISSION.md, then immediately writing AGENT_STARTED.json in the job root.",
+            script,
+        )
         self.assertIn('"status": "running"', script)
         self.assertIn('"session_name": "dbx-ship-123"', script)
 

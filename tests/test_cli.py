@@ -1143,6 +1143,88 @@ class CliTests(unittest.TestCase):
         self.assertEqual(runtime["state"], "running")
         self.assertGreaterEqual(sleep.call_count, 1)
 
+    def test_wait_for_runtime_ready_raises_auth_failed_while_runtime_is_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = cli.load_config(_write_sample_config(tmpdir))
+            job_state = _sample_job_state()
+            paths = cli._remote_paths(job_state)
+
+            def remote_file_exists(_target: str, path: str) -> bool:
+                if path == paths["agent_started_json"]:
+                    self.fail("agent heartbeat should not be checked after codex auth failure")
+                return path in {
+                    "/var/lib/cloud/instance/boot-finished",
+                    paths["codex_log"],
+                }
+
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch(
+                    "dbx.cli.describe_instance_status",
+                    return_value={
+                        "SystemStatus": {"Status": "initializing"},
+                        "InstanceStatus": {"Status": "initializing"},
+                    },
+                ):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch(
+                            "dbx.cli._remote_file_exists",
+                            side_effect=remote_file_exists,
+                        ):
+                            with patch(
+                                "dbx.cli._read_remote_json",
+                                return_value={
+                                    "phase": "runtime",
+                                    "state": "starting",
+                                    "detail": "waiting_for_agent_heartbeat",
+                                },
+                            ):
+                                with patch(
+                                    "dbx.cli._remote_tmux_session_exists",
+                                    return_value=True,
+                                ):
+                                    with patch(
+                                        "dbx.cli._tail_remote_text",
+                                        return_value="Error: login required\n",
+                                    ):
+                                        with patch(
+                                            "dbx.cli._capture_remote_artifacts",
+                                            return_value={
+                                                "status_json": {
+                                                    "phase": "runtime",
+                                                    "state": "starting",
+                                                    "detail": "waiting_for_agent_heartbeat",
+                                                },
+                                                "codex_log": "Error: login required\n",
+                                            },
+                                        ):
+                                            with patch(
+                                                "dbx.cli._persist_remote_artifacts"
+                                            ) as persist_artifacts:
+                                                with self.assertRaises(
+                                                    cli.RuntimeLifecycleError
+                                                ) as raised:
+                                                    cli._wait_for_runtime_ready(
+                                                        config,
+                                                        job_state,
+                                                        timeout_seconds=1,
+                                                        poll_interval_seconds=0,
+                                                    )
+
+        self.assertEqual(raised.exception.status, "auth_failed")
+        self.assertEqual(raised.exception.detail, "codex_auth_failed")
+        self.assertEqual(
+            raised.exception.runtime["detail"],
+            "codex_auth_failed",
+        )
+        persist_artifacts.assert_called_once()
+
     def test_attach_check_reports_ready_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
