@@ -236,6 +236,33 @@ class AwsTests(unittest.TestCase):
         )
         self.assertIn("DBX_FINISH_DONE", script)
 
+    def test_build_user_data_remote_watcher_marks_codex_auth_failure_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config = load_config(str(config_path))
+            request = JobLaunchRequest(
+                repo="er-fo/db-x",
+                mission_path=mission_path,
+                job_name="dbx-ship-123",
+                branch_name="agent/ship-123",
+                session_name="dbx-ship-123",
+                base_branch="feature/base",
+            )
+
+            script = build_user_data(config, request)
+
+        self.assertIn("state': 'auth_failed'", script)
+        self.assertIn("detail': 'codex_auth_failed'", script)
+        self.assertIn("dbx detected a Codex authentication failure after runtime startup.", script)
+        self.assertIn('tail -n 80 "$LOG_FILE"', script)
+        self.assertIn("refresh token was already used", script)
+        self.assertIn("access token could not be refreshed", script)
+        self.assertIn('/usr/local/bin/dbx-finish-job --mode blocked --base "$BASE_BRANCH" --shutdown', script)
+        self.assertIn('/usr/local/bin/dbx-finish-job --mode unknown --base "$BASE_BRANCH" --shutdown', script)
+
 
 def _sample_config() -> str:
     return """
