@@ -1897,6 +1897,7 @@ def _build_status_summary(
         if include_logs:
             summary["logs"] = {
                 "bootstrap": artifacts.get("bootstrap_log"),
+                "preflight": artifacts.get("preflight_log"),
                 "codex": artifacts.get("codex_log"),
                 "finish": artifacts.get("finish_log"),
             }
@@ -1983,6 +1984,11 @@ def _capture_remote_artifacts(
             "bootstrap_log",
             lambda: _tail_remote_text(target, paths["bootstrap_log"]),
         )
+        artifacts["preflight_log"] = _capture_artifact(
+            artifacts,
+            "preflight_log",
+            lambda: _tail_remote_text(target, paths["preflight_log"], optional=True),
+        )
         artifacts["finish_log"] = _capture_artifact(
             artifacts,
             "finish_log",
@@ -2055,6 +2061,8 @@ def _persist_remote_artifacts(job_id: str, artifacts: dict[str, object]) -> None
         save_job_artifact(job_id, "BLOCKER.md", _redact_text(artifacts["blocker"]))
     if "bootstrap_log" in artifacts and isinstance(artifacts["bootstrap_log"], str):
         save_job_artifact(job_id, "bootstrap.log", _redact_text(artifacts["bootstrap_log"]))
+    if "preflight_log" in artifacts and isinstance(artifacts["preflight_log"], str):
+        save_job_artifact(job_id, "preflight.log", _redact_text(artifacts["preflight_log"]))
     if "codex_log" in artifacts and isinstance(artifacts["codex_log"], str):
         save_job_artifact(job_id, "codex.log", _redact_text(artifacts["codex_log"]))
     if "finish_log" in artifacts and isinstance(artifacts["finish_log"], str):
@@ -2143,6 +2151,7 @@ def _remote_paths(job_state: JobState) -> dict[str, str]:
         "status_md": f"{job_root}/STATUS.md",
         "blocker": f"{job_root}/BLOCKER.md",
         "bootstrap_log": f"{job_root}/logs/bootstrap.log",
+        "preflight_log": f"{job_root}/logs/preflight.log",
         "codex_log": f"{job_root}/logs/codex.log",
         "finish_log": f"{job_root}/logs/finish.log",
     }
@@ -2395,7 +2404,15 @@ def _redact_value(value: object) -> object:
 
 def _artifact_excerpts(artifacts: dict[str, object]) -> dict[str, object]:
     excerpts: dict[str, object] = {}
-    for key in ("status_json", "status_md", "blocker", "bootstrap_log", "codex_log", "finish_log"):
+    for key in (
+        "status_json",
+        "status_md",
+        "blocker",
+        "bootstrap_log",
+        "preflight_log",
+        "codex_log",
+        "finish_log",
+    ):
         value = artifacts.get(key)
         if isinstance(value, dict):
             excerpts[key] = value
@@ -2455,6 +2472,7 @@ def _build_local_status_summary(
     if include_logs:
         summary["logs"] = {
             "bootstrap": artifacts.get("bootstrap.log"),
+            "preflight": artifacts.get("preflight.log"),
             "codex": artifacts.get("codex.log"),
             "finish": artifacts.get("finish.log"),
         }

@@ -1088,6 +1088,7 @@ class CliTests(unittest.TestCase):
                                     "status_md": "# dbx-job\n",
                                     "blocker": None,
                                     "bootstrap_log": "boot\n",
+                                    "preflight_log": "preflight\n",
                                     "codex_log": "codex\n",
                                     "finish_log": "finish\n",
                                 },
@@ -1101,6 +1102,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["remote_status"]["state"], "running")
+        self.assertEqual(payload["logs"]["preflight"], "preflight\n")
         self.assertEqual(payload["logs"]["codex"], "codex\n")
 
     def test_status_marks_auth_failed_when_codex_log_shows_auth_error(self) -> None:
@@ -1917,7 +1919,7 @@ class CliTests(unittest.TestCase):
             ):
                 with patch(
                     "dbx.cli._tail_remote_text",
-                    side_effect=["codex\n", "boot\n", "finish\n"],
+                    side_effect=["codex\n", "boot\n", "preflight\n", "finish\n"],
                 ):
                     artifacts = cli._capture_remote_artifacts(
                         "ubuntu@dbx-job",
@@ -1927,6 +1929,7 @@ class CliTests(unittest.TestCase):
 
         self.assertIsNone(artifacts["status_json"])
         self.assertEqual(artifacts["status_md"], "# status\n")
+        self.assertEqual(artifacts["preflight_log"], "preflight\n")
         self.assertEqual(artifacts["codex_log"], "codex\n")
         self.assertIn("status_json", artifacts["errors"])
 
@@ -1934,6 +1937,7 @@ class CliTests(unittest.TestCase):
         artifacts = {
             "status_json": {"phase": "runtime", "state": "blocked", "detail": "auth"},
             "blocker": "token ghp_1234567890abcdefghijklmnopqrstuvwxyz leaks",
+            "preflight_log": "OPENAI_API_KEY=sk-proj-secret\n",
             "codex_log": "TAILSCALE_AUTH_KEY=tskey-auth-123\nOPENAI_API_KEY=sk-proj-secret\n",
         }
 
@@ -1942,9 +1946,12 @@ class CliTests(unittest.TestCase):
 
         saved_contents = {call.args[1]: call.args[2] for call in save_artifact.call_args_list}
         self.assertIn("BLOCKER.md", saved_contents)
+        self.assertIn("preflight.log", saved_contents)
         self.assertIn("[REDACTED]", saved_contents["BLOCKER.md"])
+        self.assertIn("[REDACTED]", saved_contents["preflight.log"])
         self.assertIn("[REDACTED]", saved_contents["codex.log"])
         self.assertNotIn("ghp_", saved_contents["BLOCKER.md"])
+        self.assertNotIn("sk-proj-secret", saved_contents["preflight.log"])
         self.assertNotIn("sk-proj-secret", saved_contents["codex.log"])
 
     def test_list_includes_local_terminated_jobs_not_visible_in_aws(self) -> None:

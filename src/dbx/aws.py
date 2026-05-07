@@ -76,11 +76,19 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     )
     blocker_file = f"{job_root}/BLOCKER.md"
     prompt_file = f"{job_root}/BOOTSTRAP_PROMPT.txt"
+    preflight_prompt_file = f"{job_root}/DBX_PREFLIGHT_PROMPT.txt"
     log_dir = f"{job_root}/logs"
     bootstrap_log = f"{log_dir}/bootstrap.log"
+    preflight_log = f"{log_dir}/preflight.log"
     log_file = f"{log_dir}/codex.log"
     finish_log = f"{log_dir}/finish.log"
     codex_command = _build_codex_command(request, prompt_file, repo_dir)
+    codex_preflight_command = _build_codex_preflight_command(preflight_prompt_file, repo_dir)
+    preflight_prompt = _build_preflight_prompt()
+    preflight_hooks_json = _build_hook_config("/usr/local/bin/dbx-preflight-hook")
+    runtime_hooks_json = _build_hook_config(
+        f"/usr/local/bin/dbx-finish-job --mode hook --base {request.base_branch} --shutdown"
+    )
     resume_session_remote_path = _remote_codex_session_path(
         config, request.resume_session_relative_path
     )
@@ -97,8 +105,10 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         f"AGENT_STARTED_JSON={shlex.quote(agent_started_json)}",
         f"BLOCKER_FILE={shlex.quote(blocker_file)}",
         f"PROMPT_FILE={shlex.quote(prompt_file)}",
+        f"PREFLIGHT_PROMPT_FILE={shlex.quote(preflight_prompt_file)}",
         f"LOG_DIR={shlex.quote(log_dir)}",
         f"BOOTSTRAP_LOG={shlex.quote(bootstrap_log)}",
+        f"PREFLIGHT_LOG={shlex.quote(preflight_log)}",
         f"LOG_FILE={shlex.quote(log_file)}",
         f"FINISH_LOG={shlex.quote(finish_log)}",
         f"SESSION_NAME={shlex.quote(request.session_name)}",
@@ -110,7 +120,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         f"RESUME_SESSION_REMOTE_PATH={shlex.quote(resume_session_remote_path or '')}",
         "DBX_USER=ubuntu",
         "mkdir -p \"$JOB_ROOT\" \"$LOG_DIR\"",
-        "touch \"$FINISH_LOG\"",
+        "touch \"$PREFLIGHT_LOG\" \"$FINISH_LOG\"",
         "chown -R \"$DBX_USER\":\"$DBX_USER\" \"$JOB_ROOT\"",
         "exec > >(tee -a \"$BOOTSTRAP_LOG\") 2>&1",
         "write_status() {",
@@ -196,7 +206,10 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "cat >\"$PROMPT_FILE\" <<'" + prompt_marker + "'",
         bootstrap_prompt,
         prompt_marker,
-        "chown \"$DBX_USER\":\"$DBX_USER\" \"$MISSION_FILE\" \"$PROMPT_FILE\"",
+        "cat >\"$PREFLIGHT_PROMPT_FILE\" <<'DBX_PREFLIGHT_PROMPT_EOF'",
+        preflight_prompt,
+        "DBX_PREFLIGHT_PROMPT_EOF",
+        "chown \"$DBX_USER\":\"$DBX_USER\" \"$MISSION_FILE\" \"$PROMPT_FILE\" \"$PREFLIGHT_PROMPT_FILE\"",
         "write_status \"bootstrap\" \"running\" \"cloning repository\"",
         "sudo -u \"$DBX_USER\" -H env GH_PROMPT_DISABLED=1 gh auth status >/dev/null",
         "sudo -u \"$DBX_USER\" -H env GH_PROMPT_DISABLED=1 gh auth setup-git >/dev/null",
@@ -335,6 +348,118 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "fi",
         "DBX_FINISH_JOB_EOF",
         "chmod 755 /usr/local/bin/dbx-finish-job",
+        "cat >\"/usr/local/bin/dbx-preflight-hook\" <<'DBX_PREFLIGHT_HOOK_EOF'",
+        "#!/bin/bash",
+        "set -euo pipefail",
+        f"PREFLIGHT_LOG={shlex.quote(preflight_log)}",
+        "printf '%s\\n' 'dbx preflight hook invoked' >>\"$PREFLIGHT_LOG\"",
+        "DBX_PREFLIGHT_HOOK_EOF",
+        "chmod 755 /usr/local/bin/dbx-preflight-hook",
+        "cat >\"/usr/local/bin/dbx-codex-preflight\" <<'DBX_CODEX_PREFLIGHT_EOF'",
+        "#!/bin/bash",
+        "set +e",
+        f"JOB_ROOT={shlex.quote(job_root)}",
+        f"REPO_DIR={shlex.quote(repo_dir)}",
+        f"STATUS_FILE={shlex.quote(status_file)}",
+        f"STATUS_JSON={shlex.quote(status_json)}",
+        f"BLOCKER_FILE={shlex.quote(blocker_file)}",
+        f"PREFLIGHT_LOG={shlex.quote(preflight_log)}",
+        f"PREFLIGHT_PROMPT_FILE={shlex.quote(preflight_prompt_file)}",
+        f"SESSION_NAME={shlex.quote(request.session_name)}",
+        "PREFLIGHT_SESSION=\"$SESSION_NAME-preflight\"",
+        "PREFLIGHT_TIMEOUT_SECONDS=90",
+        "PREFLIGHT_TAIL_RAW=\"$JOB_ROOT/preflight-failure.raw.txt\"",
+        "PREFLIGHT_TAIL_REDACTED=\"$JOB_ROOT/preflight-failure.redacted.txt\"",
+        "write_preflight_blocker() {",
+        "  local detail=\"$1\"",
+        "  local title='# Codex preflight failed'",
+        "  local summary='dbx could not verify Codex runtime health before starting the long-running tmux session.'",
+        "  case \"$detail\" in",
+        "    codex_auth_failed)",
+        "      title='# Codex authentication failed'",
+        "      summary='dbx detected a Codex authentication failure during VM preflight.'",
+        "      ;;",
+        "    codex_hook_config_invalid)",
+        "      title='# Codex hook config is invalid'",
+        "      summary='dbx detected a Codex hooks configuration failure during VM preflight.'",
+        "      ;;",
+        "  esac",
+        "  tail -n 120 \"$PREFLIGHT_LOG\" >\"$PREFLIGHT_TAIL_RAW\" 2>/dev/null || true",
+        "  redact_text_file \"$PREFLIGHT_TAIL_RAW\" \"$PREFLIGHT_TAIL_REDACTED\"",
+        "  write_status \"bootstrap\" \"blocked\" \"$detail\"",
+        "  cat >\"$BLOCKER_FILE\" <<EOF",
+        "$title",
+        "",
+        "$summary",
+        "",
+        "## preflight.log tail",
+        "EOF",
+        "  cat \"$PREFLIGHT_TAIL_REDACTED\" >>\"$BLOCKER_FILE\" 2>/dev/null || true",
+        "  rm -f \"$PREFLIGHT_TAIL_RAW\" \"$PREFLIGHT_TAIL_REDACTED\"",
+        "}",
+        "classify_preflight() {",
+        "  python3 - \"$PREFLIGHT_LOG\" <<'PY'",
+        "import re",
+        "import sys",
+        "from pathlib import Path",
+        "path = Path(sys.argv[1])",
+        "text = path.read_text(encoding='utf-8') if path.exists() else ''",
+        "if 'DBX_PREFLIGHT_OK' in text:",
+        "    print('ok')",
+        "    raise SystemExit(0)",
+        "if re.search(r'failed to parse hooks config|invalid generated hooks schema', text, re.IGNORECASE):",
+        "    print('codex_hook_config_invalid')",
+        "    raise SystemExit(0)",
+        "auth_patterns = [",
+        "    r'not logged in',",
+        "    r'login required',",
+        "    r'invalid api key',",
+        "    r'token_expired',",
+        "    r'authentication token is expired',",
+        "    r'access token could not be refreshed',",
+        "    r'refresh token was already used',",
+        "    r'please log out and sign in again',",
+        "]",
+        "if any(re.search(pattern, text, re.IGNORECASE) for pattern in auth_patterns):",
+        "    print('codex_auth_failed')",
+        "    raise SystemExit(0)",
+        "if re.search(r'MCP startup incomplete|MCP client .* failed to start|No more recovery steps available', text, re.IGNORECASE):",
+        "    print('codex_preflight_failed')",
+        "    raise SystemExit(0)",
+        "print('pending')",
+        "PY",
+        "}",
+        ": >\"$PREFLIGHT_LOG\"",
+        "tmux kill-session -t \"$PREFLIGHT_SESSION\" >/dev/null 2>&1 || true",
+        "tmux new-session -d -s \"$PREFLIGHT_SESSION\" -c \"$REPO_DIR\"",
+        "tmux pipe-pane -o -t \"$PREFLIGHT_SESSION\":0.0 \"cat >> '$PREFLIGHT_LOG'\"",
+        f"tmux send-keys -t \"$PREFLIGHT_SESSION\":0.0 {shlex.quote(codex_preflight_command)} C-m",
+        "STARTED_AT=$(date +%s)",
+        "while true; do",
+        "  RESULT=\"$(classify_preflight)\"",
+        "  if [ \"$RESULT\" = \"ok\" ]; then",
+        "    tmux kill-session -t \"$PREFLIGHT_SESSION\" >/dev/null 2>&1 || true",
+        "    exit 0",
+        "  fi",
+        "  if [ \"$RESULT\" != \"pending\" ]; then",
+        "    tmux kill-session -t \"$PREFLIGHT_SESSION\" >/dev/null 2>&1 || true",
+        "    write_preflight_blocker \"$RESULT\"",
+        "    exit 1",
+        "  fi",
+        "  if ! tmux has-session -t \"$PREFLIGHT_SESSION\" >/dev/null 2>&1; then",
+        "    write_preflight_blocker codex_preflight_failed",
+        "    exit 1",
+        "  fi",
+        "  NOW=$(date +%s)",
+        "  if [ $((NOW - STARTED_AT)) -ge \"$PREFLIGHT_TIMEOUT_SECONDS\" ]; then",
+        "    tmux kill-session -t \"$PREFLIGHT_SESSION\" >/dev/null 2>&1 || true",
+        "    write_preflight_blocker codex_preflight_failed",
+        "    exit 1",
+        "  fi",
+        "  sleep 2",
+        "done",
+        "DBX_CODEX_PREFLIGHT_EOF",
+        "chmod 755 /usr/local/bin/dbx-codex-preflight",
         "cat >\"/usr/local/bin/dbx-codex-watch\" <<'DBX_CODEX_WATCH_EOF'",
         "#!/bin/bash",
         "set +e",
@@ -449,14 +574,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "        handle.write('\\n[features]\\ncodex_hooks = true\\n')",
         "PY",
         "sudo -u \"$DBX_USER\" -H tee \"/home/$DBX_USER/.codex/hooks.json\" >/dev/null <<'DBX_HOOKS_EOF'",
-        "{",
-        "  \"hooks\": [",
-        "    {",
-        "      \"event\": \"Stop\",",
-        f"      \"command\": \"/usr/local/bin/dbx-finish-job --mode hook --base {request.base_branch} --shutdown\"",
-        "    }",
-        "  ]",
-        "}",
+        *preflight_hooks_json.splitlines(),
         "DBX_HOOKS_EOF",
         "if [ -n \"$TAILSCALE_AUTH_KEY\" ]; then",
         "  write_status \"bootstrap\" \"running\" \"connecting tailscale\"",
@@ -489,6 +607,17 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "  exit 0",
         "fi",
         "rm -f \"$AUTH_STATUS_RAW\" \"$AUTH_STATUS_REDACTED\"",
+        "write_status \"bootstrap\" \"running\" \"running codex preflight\"",
+        "set +e",
+        "sudo -u \"$DBX_USER\" -H /usr/local/bin/dbx-codex-preflight",
+        "PREFLIGHT_EXIT=$?",
+        "set -e",
+        "if [ \"$PREFLIGHT_EXIT\" -ne 0 ]; then",
+        "  exit 0",
+        "fi",
+        "sudo -u \"$DBX_USER\" -H tee \"/home/$DBX_USER/.codex/hooks.json\" >/dev/null <<'DBX_RUNTIME_HOOKS_EOF'",
+        *runtime_hooks_json.splitlines(),
+        "DBX_RUNTIME_HOOKS_EOF",
         "write_status \"bootstrap\" \"running\" \"starting tmux codex session\"",
         "sudo -u \"$DBX_USER\" -H tmux new-session -d -s \"$SESSION_NAME\" -c \"$REPO_DIR\"",
         "sudo -u \"$DBX_USER\" -H tmux pipe-pane -o -t \"$SESSION_NAME\":0.0 \"cat >> '$LOG_FILE'\"",
@@ -769,3 +898,42 @@ def _build_codex_command(request: JobLaunchRequest, prompt_file: str, repo_dir: 
         session_id = shlex.quote(request.resume_session_id)
         return f"{codex} resume {session_id} {prompt_expr}"
     return f"{codex} {prompt_expr}"
+
+
+def _build_codex_preflight_command(prompt_file: str, repo_dir: str) -> str:
+    prompt_expr = f'"$(cat {shlex.quote(prompt_file)})"'
+    codex = (
+        "codex --no-alt-screen --ask-for-approval never "
+        f"--sandbox danger-full-access -C {shlex.quote(repo_dir)}"
+    )
+    return f"{codex} {prompt_expr}"
+
+
+def _build_preflight_prompt() -> str:
+    return "\n".join(
+        [
+            "You are running a dbx VM bootstrap preflight.",
+            "Do not use tools.",
+            "Reply with exactly DBX_PREFLIGHT_OK and nothing else.",
+        ]
+    )
+
+
+def _build_hook_config(command: str) -> str:
+    return json.dumps(
+        {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": command,
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        indent=2,
+    )
