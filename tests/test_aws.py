@@ -194,6 +194,8 @@ class AwsTests(unittest.TestCase):
         self.assertIn("gh pr create --base \"$BASE_BRANCH\"", script)
         self.assertIn("shutdown -h now", script)
         self.assertIn("dbx-codex-watch", script)
+        self.assertIn("dbx-finish-ready complete", script)
+        self.assertIn("dbx-finish-ready blocked", script)
 
 
 def _sample_config() -> str:

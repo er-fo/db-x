@@ -2,6 +2,12 @@
 
 `db-x` is a disposable AWS devbox runner for long-running Codex + Superpowers work.
 
+The purpose is handoff continuity: when Erik is moving between places, agents
+should keep running, preserve context, and finish the task while he is on the
+move. `db-x` announces the environment and mission to a fresh VM agent so it can
+continue the work, keep git clean, and hand the completed or blocked branch to a
+pull request lifecycle without requiring Erik's laptop to stay online.
+
 It launches a fresh EC2 instance per mission, boots it from a private golden AMI,
 runs Codex inside `tmux`, and then terminates the machine when the work is done
 or blocked. The goal is simple: keep the autonomy and long-running ergonomics of
@@ -15,8 +21,9 @@ a real devbox without leaving compute running between jobs.
 - Keeps Codex running in `tmux`
 - Clones the repo, creates a branch, and starts Codex on-instance
 - Keeps local job metadata so `list` and `status` stay informative
-- Preserves remote work, pushes the job branch, opens a PR, and terminates the
-  instance with `finish`
+- Installs a VM-local Codex Stop hook and watcher so completion/blocker handoff
+  can preserve remote work, push the job branch, open or update a PR, and shut
+  down the instance after the PR URL is confirmed
 
 ## What it does not do yet
 
@@ -66,6 +73,27 @@ the latest Codex output from `logs/codex.log`; it does not include cloud-init,
 finish, or status artifacts.
 
 `dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
+
+## Finish lifecycle
+
+The normal finish path is automatic. When the VM agent completes verified work,
+it runs:
+
+```bash
+dbx-finish-ready complete "short completion summary"
+```
+
+When it is safely blocked, it runs:
+
+```bash
+dbx-finish-ready blocked "short blocker summary"
+```
+
+The Codex Stop hook sees that readiness marker and runs the shared VM-local
+finish script. If Codex exits without a marker, the watcher treats the stop as
+unknown, creates or updates a draft PR, and shuts down only after the PR URL is
+confirmed. `dbx finish <instance-id>` remains available as an operator recovery
+command; it delegates to the same VM-local finish script.
 
 ## Config
 
