@@ -410,7 +410,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["instance_id"], "i-123")
         self.assertEqual(payload["runtime"]["state"], "ready")
 
-    def test_start_uses_configured_defaults_and_opens_picker_when_no_args(self) -> None:
+    def test_start_without_args_runs_resume_wizard_with_configured_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / ".codex" / "sessions"
             _write_codex_session(
@@ -430,7 +430,7 @@ class CliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             saved_jobs = []
-            stdin = _TTYInput("\n")
+            stdin = _TTYInput("\n\n\n")
             with patch("dbx.cli._codex_sessions_root", return_value=root):
                 with patch("sys.stdin", new=stdin):
                     with patch("sys.stderr", new=io.StringIO()) as stderr:
@@ -456,7 +456,17 @@ class CliTests(unittest.TestCase):
                                             )
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("Use ↑/↓", stderr.getvalue())
+        wizard_output = stderr.getvalue()
+        self.assertIn("dbx start launch wizard", wizard_output)
+        self.assertIn("Step 1/3: Choose launch mode", wizard_output)
+        self.assertIn("Resume local Codex session", wizard_output)
+        self.assertIn("Step 2/3: Choose Codex session", wizard_output)
+        self.assertIn("Currently selected", wizard_output)
+        self.assertIn("resume default launch", wizard_output)
+        self.assertIn("Step 3/3: Review launch", wizard_output)
+        self.assertIn("Repo: er-fo/db-x", wizard_output)
+        self.assertIn(f"Mission: {mission_path.resolve()}", wizard_output)
+        self.assertIn("AWS: c7i.xlarge in eu-north-1", wizard_output)
         self.assertEqual(saved_jobs[-1].repo, "er-fo/db-x")
         self.assertEqual(saved_jobs[-1].mission_path, str(mission_path.resolve()))
         self.assertEqual(
@@ -467,6 +477,175 @@ class CliTests(unittest.TestCase):
         self.assertEqual(request.repo, "er-fo/db-x")
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["instance_id"], "i-123")
+
+    def test_start_wizard_can_launch_fresh_mission_without_resume_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="available but not resumed",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            saved_jobs = []
+            stdin = _TTYInput("\x1b[B\n\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli.save_job_state",
+                                    side_effect=saved_jobs.append,
+                                ):
+                                    with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                        exit_code = cli.main(
+                                            ["--config", str(config_path), "start"]
+                                        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Start fresh mission", stderr.getvalue())
+        self.assertIsNone(saved_jobs[-1].resume_session_id)
+        payload = json.loads(stdout.getvalue())
+        self.assertIsNone(payload["resume_session_id"])
+
+    def test_start_wizard_accepts_pasted_session_id_before_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="first visible session",
+                mtime=200,
+            )
+            _write_codex_session(
+                root,
+                session_id="019dfe10-8e20-7580-ba09-86c21ace5c81",
+                created_at="2026-05-06T18:13:11Z",
+                latest_user_message="pasted session to resume",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            saved_jobs = []
+            stdin = _TTYInput("\x1b[B\x1b[B\n019dfe10-8e20-7580-ba09-86c21ace5c81\n\n")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch(
+                            "dbx.cli.launch_instance",
+                            return_value={"Instances": [{"InstanceId": "i-123"}]},
+                        ):
+                            with patch(
+                                "dbx.cli._wait_for_runtime_ready",
+                                return_value={"phase": "runtime", "state": "ready"},
+                            ):
+                                with patch(
+                                    "dbx.cli._upload_resume_session_when_reachable",
+                                    return_value={"remote_path": "/home/ubuntu/.codex/sessions/picked.jsonl"},
+                                ):
+                                    with patch(
+                                        "dbx.cli.save_job_state",
+                                        side_effect=saved_jobs.append,
+                                    ):
+                                        with patch("sys.stdout", new=io.StringIO()):
+                                            exit_code = cli.main(
+                                                ["--config", str(config_path), "start"]
+                                            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Paste session ID or path", stderr.getvalue())
+        self.assertIn("pasted session to resume", stderr.getvalue())
+        self.assertEqual(
+            saved_jobs[-1].resume_session_id,
+            "019dfe10-8e20-7580-ba09-86c21ace5c81",
+        )
+
+    def test_start_wizard_cancel_does_not_launch_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+                created_at="2026-05-06T21:11:54Z",
+                latest_user_message="do not launch this",
+                mtime=100,
+            )
+            mission_path = Path(tmpdir) / "mission.md"
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                _sample_config()
+                + f'default_repo = "er-fo/db-x"\n'
+                + f'default_mission = "{mission_path}"\n',
+                encoding="utf-8",
+            )
+            stdin = _TTYInput("q")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch("sys.stdin", new=stdin):
+                    with patch("sys.stderr", new=io.StringIO()) as stderr:
+                        with patch("dbx.cli.launch_instance") as launch_instance:
+                            exit_code = cli.main(["--config", str(config_path), "start"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("No dbx launch selected", stderr.getvalue())
+        launch_instance.assert_not_called()
+
+    def test_start_wizard_session_preview_renders_selected_details(self) -> None:
+        session_path = Path(
+            "/tmp/sessions/2026/05/06/"
+            "rollout-2026-05-06T21-11-54-019dfeb4-2e25-7173-8ab9-006893040db2.jsonl"
+        )
+        session = cli.CodexSession(
+            session_id="019dfeb4-2e25-7173-8ab9-006893040db2",
+            path=session_path,
+            relative_path="2026/05/06/rollout.jsonl",
+            created_at="2026-05-06T21:11:54Z",
+            updated_at="2026-05-06T21:15:00Z",
+            branch="main",
+            latest_user_message="make the selector more interactive",
+            size_bytes=1234,
+        )
+        output = io.StringIO()
+
+        cli._render_codex_session_picker(
+            [session],
+            selected_index=0,
+            typed="",
+            output_stream=output,
+            clear_screen=False,
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("Currently selected", rendered)
+        self.assertIn("make the selector more interactive", rendered)
+        self.assertIn("Branch: main", rendered)
+        self.assertIn("Session: 019dfeb4-2e25-7173-8ab9-006893040db2", rendered)
+        self.assertIn(str(session_path), rendered)
 
     def test_start_without_args_requires_configured_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

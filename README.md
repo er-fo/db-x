@@ -43,14 +43,19 @@ dbx finish i-0123456789abcdef0
 dbx terminate i-0123456789abcdef0
 ```
 
-Use `dbx start` for the normal interactive flow. It uses `default_repo` and
-`default_mission` from the config, opens an arrow-key picker over the latest
-local Codex sessions, and resumes the selected conversation. `dbx sessions`
-prints the same simple 10-row table with created time, updated time, branch,
-full session path, and latest user message. The picker also accepts a pasted
-session ID or path. Subagent sessions are excluded, so the list shows direct
-user-submitted conversations. `dbx start <repo> <mission>` and
-`--resume-session <session-id>` remain available for scripted launches.
+Use `dbx start` for the normal guided launch flow. It uses `default_repo` and
+`default_mission` from the config, then opens a terminal wizard that lets you
+resume a local Codex session, start a fresh mission, paste a session ID/path,
+and review the exact repo, mission, AWS target, and resume choice before any EC2
+instance is launched. The session step shows a live "Currently selected" preview
+with the conversation, branch, session ID, and full path, so the launch purpose
+is clear before you press Enter.
+
+`dbx sessions` prints the same simple 10-row table with created time, updated
+time, branch, full session path, and latest user message. Subagent sessions are
+excluded, so the list shows direct user-submitted conversations.
+`dbx start <repo> <mission>` and `--resume-session <session-id>` remain
+available for scripted launches.
 
 `dbx attach` prints the exact SSH command to run. It does not execute SSH for you yet.
 

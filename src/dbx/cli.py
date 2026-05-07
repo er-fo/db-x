@@ -73,6 +73,21 @@ class CodexSession:
         }
 
 
+@dataclass(frozen=True)
+class StartWizardSelection:
+    repo: str
+    mission: str
+    resume_session_id: str | None
+    launch_mode: str
+
+
+@dataclass(frozen=True)
+class WizardMenuOption:
+    key: str
+    label: str
+    detail: str = ""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -351,7 +366,9 @@ def run_start(
     wait: bool = True,
     timeout_seconds: int = 600,
 ) -> int:
-    should_auto_pick = repo is None and mission is None and resume_session_id is None and not pick_session
+    should_run_wizard = (
+        repo is None and mission is None and resume_session_id is None and not pick_session
+    )
     repo, mission = _resolve_start_inputs(config, repo, mission)
     if repo is None or mission is None:
         print(
@@ -360,19 +377,37 @@ def run_start(
             file=sys.stderr,
         )
         return 2
-    if should_auto_pick:
-        pick_session = True
     mission_path = Path(mission).expanduser().resolve()
     if not mission_path.exists():
         print(f"Mission file not found: {mission_path}", file=sys.stderr)
         return 2
     if "/" not in repo:
         repo = f"{config.default_owner}/{repo}"
+    if should_run_wizard:
+        try:
+            selection = _run_start_wizard(
+                config,
+                repo,
+                str(mission_path),
+                wait=wait,
+                input_stream=sys.stdin,
+                output_stream=sys.stderr,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        repo = selection.repo
+        mission = selection.mission
+        mission_path = Path(mission)
+        resume_session_id = selection.resume_session_id
     if resume_session_id == PICK_SESSION:
         resume_session_id = None
         pick_session = True
     if pick_session and resume_session_id:
-        print("Use either --pick-session or --resume-session SESSION_ID, not both.", file=sys.stderr)
+        print(
+            "Use either --pick-session or --resume-session SESSION_ID, not both.",
+            file=sys.stderr,
+        )
         return 2
     if pick_session:
         try:
@@ -698,10 +733,123 @@ def _pick_codex_session() -> CodexSession:
     return _run_codex_session_picker(sessions, sys.stdin, sys.stderr)
 
 
+def _run_start_wizard(
+    config: AppConfig,
+    repo: str,
+    mission: str,
+    *,
+    wait: bool,
+    input_stream,
+    output_stream,
+) -> StartWizardSelection:
+    if not _stream_is_tty(input_stream):
+        raise ValueError("Cannot run the dbx start wizard without an interactive terminal.")
+
+    sessions = _discover_codex_sessions(limit=SESSION_LIST_LIMIT)
+    while True:
+        launch_mode = _run_start_mode_picker(
+            sessions,
+            repo=repo,
+            mission=mission,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+        if launch_mode == "cancel":
+            raise ValueError("No dbx launch selected.")
+
+        selected_session = None
+        if launch_mode == "resume":
+            try:
+                selected_session = _run_codex_session_picker(
+                    sessions,
+                    input_stream,
+                    output_stream,
+                    heading="dbx start launch wizard",
+                    step_label="Step 2/3: Choose Codex session",
+                )
+            except ValueError:
+                raise ValueError("No dbx launch selected.") from None
+        elif launch_mode == "paste":
+            selected_session = _run_pasted_session_picker(
+                sessions,
+                input_stream=input_stream,
+                output_stream=output_stream,
+            )
+
+        review_choice = _run_start_review_picker(
+            config,
+            repo=repo,
+            mission=mission,
+            selected_session=selected_session,
+            wait=wait,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+        if review_choice == "back":
+            continue
+        if review_choice == "cancel":
+            raise ValueError("No dbx launch selected.")
+        return StartWizardSelection(
+            repo=repo,
+            mission=mission,
+            resume_session_id=selected_session.session_id if selected_session else None,
+            launch_mode=launch_mode,
+        )
+
+
+def _run_start_mode_picker(
+    sessions: list[CodexSession],
+    *,
+    repo: str,
+    mission: str,
+    input_stream,
+    output_stream,
+) -> str:
+    options: list[WizardMenuOption] = []
+    if sessions:
+        options.append(
+            WizardMenuOption(
+                "resume",
+                "Resume local Codex session",
+                "Continue work from one of the latest direct Codex sessions.",
+            )
+        )
+    options.extend(
+        [
+            WizardMenuOption(
+                "fresh",
+                "Start fresh mission",
+                "Launch a clean devbox using the configured repo and mission.",
+            ),
+            WizardMenuOption(
+                "paste",
+                "Paste session ID or path",
+                "Resume a local session by UUID or .jsonl path.",
+            ),
+            WizardMenuOption("cancel", "Cancel", "Leave AWS untouched."),
+        ]
+    )
+    selected = _run_wizard_menu(
+        step_label="Step 1/3: Choose launch mode",
+        options=options,
+        body_lines=[
+            "Default launch target",
+            f"Repo: {repo}",
+            f"Mission: {mission}",
+        ],
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
+    return selected.key
+
+
 def _run_codex_session_picker(
     sessions: list[CodexSession],
     input_stream,
     output_stream,
+    *,
+    heading: str = "Local Codex sessions",
+    step_label: str | None = None,
 ) -> CodexSession:
     selected_index = 0
     typed = ""
@@ -715,6 +863,8 @@ def _run_codex_session_picker(
                 typed=typed,
                 output_stream=output_stream,
                 clear_screen=use_screen,
+                heading=heading,
+                step_label=step_label,
             )
             key = _read_picker_key(input_stream)
             if key == "down":
@@ -728,7 +878,11 @@ def _run_codex_session_picker(
                     matched = _match_session_selection(typed, sessions)
                     if matched is not None:
                         return matched
-                    print("No matching session. Use arrows, a number, or paste a session ID/path.", file=output_stream)
+                    print(
+                        "No matching session. Use arrows, a number, or paste a "
+                        "session ID/path.",
+                        file=output_stream,
+                    )
                     typed = ""
                     continue
                 return sessions[selected_index]
@@ -747,15 +901,210 @@ def _render_codex_session_picker(
     typed: str,
     output_stream,
     clear_screen: bool,
+    heading: str = "Local Codex sessions",
+    step_label: str | None = None,
 ) -> None:
     if clear_screen:
         output_stream.write("\033[2J\033[H")
-    output_stream.write("Local Codex sessions\n")
-    output_stream.write("Use ↑/↓ to choose, Enter to launch, q to cancel.\n")
+    output_stream.write(f"{heading}\n")
+    if step_label:
+        output_stream.write(f"{step_label}\n")
+    output_stream.write("Use ↑/↓ to choose, Enter to select, q to cancel.\n")
     output_stream.write("You can also paste a session ID or path, then press Enter.\n\n")
     output_stream.write(_format_codex_sessions(sessions, selected_index=selected_index))
+    if sessions:
+        output_stream.write("\n")
+        output_stream.write(_format_selected_session_preview(sessions[selected_index]))
     if typed:
         output_stream.write(f"\nSelection: {typed}\n")
+    output_stream.flush()
+
+
+def _format_selected_session_preview(session: CodexSession) -> str:
+    return "\n".join(
+        [
+            "Currently selected",
+            f"Conversation: {session.latest_user_message or '(no user message)'}",
+            f"Branch: {session.branch or '-'}",
+            f"Created: {_relative_time(session.created_at)}",
+            f"Updated: {_relative_time(session.updated_at)}",
+            f"Session: {session.session_id}",
+            f"Path: {session.path}",
+            "",
+        ]
+    )
+
+
+def _run_pasted_session_picker(
+    sessions: list[CodexSession],
+    *,
+    input_stream,
+    output_stream,
+) -> CodexSession:
+    typed = ""
+    error = ""
+    use_screen = _stream_is_tty(output_stream)
+
+    with _raw_terminal(input_stream):
+        while True:
+            _render_pasted_session_picker(
+                typed=typed,
+                error=error,
+                output_stream=output_stream,
+                clear_screen=use_screen,
+            )
+            key = _read_picker_key(input_stream)
+            if key == "enter":
+                selected = _resolve_session_selection(typed, sessions)
+                if selected is not None:
+                    return selected
+                error = (
+                    "No matching local Codex session. Paste a session UUID or "
+                    ".jsonl path."
+                )
+                typed = ""
+            elif key in {"escape", "q"} and not typed:
+                raise ValueError("No dbx launch selected.")
+            elif key == "backspace":
+                typed = typed[:-1]
+                error = ""
+            elif len(key) == 1 and key.isprintable():
+                typed += key
+                error = ""
+
+
+def _render_pasted_session_picker(
+    *,
+    typed: str,
+    error: str,
+    output_stream,
+    clear_screen: bool,
+) -> None:
+    if clear_screen:
+        output_stream.write("\033[2J\033[H")
+    output_stream.write("dbx start launch wizard\n")
+    output_stream.write("Step 2/3: Paste session ID or path\n")
+    output_stream.write("Paste a Codex session UUID or .jsonl path, then press Enter.\n")
+    output_stream.write("Use q or Esc to cancel before typing.\n\n")
+    output_stream.write(f"Selection: {typed}\n")
+    if error:
+        output_stream.write(f"\n{error}\n")
+    output_stream.flush()
+
+
+def _run_start_review_picker(
+    config: AppConfig,
+    *,
+    repo: str,
+    mission: str,
+    selected_session: CodexSession | None,
+    wait: bool,
+    input_stream,
+    output_stream,
+) -> str:
+    options = [
+        WizardMenuOption("launch", "Launch", "Create the EC2 devbox now."),
+        WizardMenuOption("back", "Back", "Return to launch mode selection."),
+        WizardMenuOption("cancel", "Cancel", "Leave AWS untouched."),
+    ]
+    selected = _run_wizard_menu(
+        step_label="Step 3/3: Review launch",
+        options=options,
+        body_lines=_start_review_lines(
+            config,
+            repo=repo,
+            mission=mission,
+            selected_session=selected_session,
+            wait=wait,
+        ),
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
+    return selected.key
+
+
+def _start_review_lines(
+    config: AppConfig,
+    *,
+    repo: str,
+    mission: str,
+    selected_session: CodexSession | None,
+    wait: bool,
+) -> list[str]:
+    resume_line = "Resume: fresh Codex mission"
+    conversation_lines: list[str] = []
+    if selected_session:
+        resume_line = f"Resume: {selected_session.session_id}"
+        conversation_lines = [
+            f"Conversation: {selected_session.latest_user_message}",
+            f"Session path: {selected_session.path}",
+        ]
+    return [
+        resume_line,
+        *conversation_lines,
+        f"Repo: {repo}",
+        f"Mission: {mission}",
+        f"AWS: {config.instance_type} in {config.aws_region}",
+        f"Base branch: {config.default_base_branch}",
+        f"Wait for runtime: {'yes' if wait else 'no'}",
+    ]
+
+
+def _run_wizard_menu(
+    *,
+    step_label: str,
+    options: list[WizardMenuOption],
+    body_lines: list[str],
+    input_stream,
+    output_stream,
+) -> WizardMenuOption:
+    selected_index = 0
+    use_screen = _stream_is_tty(output_stream)
+
+    with _raw_terminal(input_stream):
+        while True:
+            _render_wizard_menu(
+                step_label=step_label,
+                options=options,
+                selected_index=selected_index,
+                body_lines=body_lines,
+                output_stream=output_stream,
+                clear_screen=use_screen,
+            )
+            key = _read_picker_key(input_stream)
+            if key == "down":
+                selected_index = min(selected_index + 1, len(options) - 1)
+            elif key == "up":
+                selected_index = max(selected_index - 1, 0)
+            elif key == "enter":
+                return options[selected_index]
+            elif key in {"escape", "q"}:
+                return WizardMenuOption("cancel", "Cancel")
+
+
+def _render_wizard_menu(
+    *,
+    step_label: str,
+    options: list[WizardMenuOption],
+    selected_index: int,
+    body_lines: list[str],
+    output_stream,
+    clear_screen: bool,
+) -> None:
+    if clear_screen:
+        output_stream.write("\033[2J\033[H")
+    output_stream.write("dbx start launch wizard\n")
+    output_stream.write(f"{step_label}\n")
+    output_stream.write("Use ↑/↓ to choose, Enter to continue, q to cancel.\n\n")
+    for index, option in enumerate(options):
+        marker = ">" if selected_index == index else " "
+        output_stream.write(f"{marker} {option.label}\n")
+        if option.detail:
+            output_stream.write(f"  {option.detail}\n")
+    if body_lines:
+        output_stream.write("\n")
+        for line in body_lines:
+            output_stream.write(f"{line}\n")
     output_stream.flush()
 
 
@@ -815,6 +1164,35 @@ def _match_session_selection(selection: str, sessions: list[CodexSession]) -> Co
     return None
 
 
+def _resolve_session_selection(selection: str, sessions: list[CodexSession]) -> CodexSession | None:
+    matched = _match_session_selection(selection, sessions)
+    if matched is not None:
+        return matched
+
+    cleaned = selection.strip()
+    if not cleaned:
+        return None
+
+    match = SESSION_ID_RE.search(cleaned)
+    if match:
+        session_file = _find_codex_session_file(match.group(1).lower())
+        if session_file is not None:
+            return _load_codex_session_file(session_file)
+
+    pasted_path = Path(cleaned).expanduser()
+    if pasted_path.exists() and pasted_path.is_file() and _is_codex_session_path(pasted_path):
+        return _load_codex_session_file(pasted_path)
+    return None
+
+
+def _is_codex_session_path(session_file: Path) -> bool:
+    try:
+        session_file.resolve().relative_to(_codex_sessions_root().resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def _stream_is_tty(stream) -> bool:
     return bool(getattr(stream, "isatty", lambda: False)())
 
@@ -829,9 +1207,29 @@ def _find_codex_session_file(session_id: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime)
 
 
+def _load_codex_session_file(session_file: Path) -> CodexSession | None:
+    session_id = _extract_session_id(session_file)
+    if session_id is None:
+        return None
+    try:
+        stat = session_file.stat()
+    except OSError:
+        return None
+    return _load_codex_session(
+        path=session_file,
+        session_id=session_id,
+        relative_path=_codex_session_relative_path(session_file),
+        updated_at=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+        size_bytes=stat.st_size,
+    )
+
+
 def _codex_session_relative_path(session_file: Path) -> str:
     root = _codex_sessions_root()
-    return session_file.expanduser().resolve().relative_to(root.expanduser().resolve()).as_posix()
+    try:
+        return session_file.expanduser().resolve().relative_to(root.expanduser().resolve()).as_posix()
+    except ValueError:
+        return session_file.name
 
 
 def _upload_resume_session_when_reachable(
