@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import gzip
 import json
 import shlex
 import subprocess
@@ -518,9 +519,9 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
 def launch_instance(config: AppConfig, request: JobLaunchRequest) -> dict[str, object]:
     user_data = build_user_data(config, request)
     with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", suffix=".sh", delete=False
+        mode="wb", suffix=".sh.gz", delete=False
     ) as handle:
-        handle.write(user_data)
+        handle.write(gzip.compress(user_data.encode("utf-8")))
         user_data_path = handle.name
 
     try:
@@ -546,7 +547,7 @@ def launch_instance(config: AppConfig, request: JobLaunchRequest) -> dict[str, o
                 "]"
             ),
             "--user-data",
-            f"file://{user_data_path}",
+            f"fileb://{user_data_path}",
             "--output",
             "json",
         ]

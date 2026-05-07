@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import gzip
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from dbx.aws import AwsCliError, JobLaunchRequest, build_ssh_target, build_user_data
+from dbx.aws import AwsCliError, JobLaunchRequest, build_ssh_target, build_user_data, launch_instance
 from dbx.aws import run_aws_cli
 from dbx.config import load_config
 
@@ -39,6 +40,40 @@ class AwsTests(unittest.TestCase):
         )
 
         self.assertEqual(target, "ubuntu@dbx-job")
+
+    def test_launch_instance_gzips_user_data_before_run_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config = load_config(str(config_path))
+            request = JobLaunchRequest(
+                repo="er-fo/db-x",
+                mission_path=mission_path,
+                job_name="dbx-ship-123",
+                branch_name="agent/ship-123",
+                session_name="dbx-ship-123",
+            )
+            user_data = "#!/bin/bash\n" + "echo smoke\n" * 100
+
+            def fake_run_aws_cli(_config, command, **kwargs):
+                user_data_arg = command[command.index("--user-data") + 1]
+                self.assertTrue(user_data_arg.startswith("fileb://"))
+                payload = Path(user_data_arg.removeprefix("fileb://")).read_bytes()
+                self.assertEqual(gzip.decompress(payload).decode("utf-8"), user_data)
+                return subprocess.CompletedProcess(
+                    args=command,
+                    returncode=0,
+                    stdout='{"Instances":[{"InstanceId":"i-123"}]}',
+                    stderr="",
+                )
+
+            with patch("dbx.aws.build_user_data", return_value=user_data):
+                with patch("dbx.aws.run_aws_cli", side_effect=fake_run_aws_cli):
+                    payload = launch_instance(config, request)
+
+        self.assertEqual(payload["Instances"][0]["InstanceId"], "i-123")
 
     def test_build_user_data_contains_clone_and_tmux_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
