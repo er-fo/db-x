@@ -62,13 +62,14 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
     mission_text = request.mission_path.read_text(encoding="utf-8")
     mission_marker = "DBX_MISSION_EOF"
     prompt_marker = "DBX_PROMPT_EOF"
-    bootstrap_prompt = _build_bootstrap_prompt()
+    bootstrap_prompt = _build_bootstrap_prompt(request.session_name)
     repo_clone_url = f"https://github.com/{request.repo}.git"
     job_root = f"{config.repo_root.rstrip('/')}/{request.job_name}"
     repo_dir = f"{job_root}/repo"
     mission_file = f"{job_root}/AGENT_MISSION.md"
     status_file = f"{job_root}/STATUS.md"
     status_json = f"{job_root}/status.json"
+    agent_started_json = f"{job_root}/AGENT_STARTED.json"
     blocker_file = f"{job_root}/BLOCKER.md"
     prompt_file = f"{job_root}/BOOTSTRAP_PROMPT.txt"
     log_dir = f"{job_root}/logs"
@@ -89,6 +90,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         f"MISSION_FILE={shlex.quote(mission_file)}",
         f"STATUS_FILE={shlex.quote(status_file)}",
         f"STATUS_JSON={shlex.quote(status_json)}",
+        f"AGENT_STARTED_JSON={shlex.quote(agent_started_json)}",
         f"BLOCKER_FILE={shlex.quote(blocker_file)}",
         f"PROMPT_FILE={shlex.quote(prompt_file)}",
         f"LOG_DIR={shlex.quote(log_dir)}",
@@ -157,6 +159,32 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "  exit \"$exit_code\"",
         "}",
         "trap 'on_error' ERR",
+        "redact_text_file() {",
+        "  local input_file=\"$1\"",
+        "  local output_file=\"$2\"",
+        "  python3 - \"$input_file\" \"$output_file\" <<'PY'",
+        "import re",
+        "import sys",
+        "from pathlib import Path",
+        "",
+        "input_path, output_path = sys.argv[1:]",
+        "text = Path(input_path).read_text(encoding='utf-8')",
+        "patterns = [",
+        "    re.compile(r'tskey-auth-[A-Za-z0-9_-]+'),",
+        "    re.compile(r'gh[pousr]_[A-Za-z0-9]{20,}'),",
+        "    re.compile(r'github_pat_[A-Za-z0-9_]{20,}'),",
+        "    re.compile(r'AKIA[0-9A-Z]{16}'),",
+        "    re.compile(r'ASIA[0-9A-Z]{16}'),",
+        "    re.compile(r'aws_secret_access_key\\s*[=:]\\s*[A-Za-z0-9/+=]{20,}', re.IGNORECASE),",
+        "    re.compile(r'sk-(?:proj-)?[A-Za-z0-9_-]{12,}'),",
+        "    re.compile(r'OPENAI_API_KEY\\s*[=:]\\s*[^\\s]+', re.IGNORECASE),",
+        "    re.compile(r'CODEX_(?:AUTH|API|TOKEN)[A-Z_]*\\s*[=:]\\s*[^\\s]+', re.IGNORECASE),",
+        "]",
+        "for pattern in patterns:",
+        "    text = pattern.sub('[REDACTED]', text)",
+        "Path(output_path).write_text(text, encoding='utf-8')",
+        "PY",
+        "}",
         "write_status \"bootstrap\" \"starting\" \"initializing job root\"",
         "cat >\"$MISSION_FILE\" <<'" + mission_marker + "'",
         mission_text,
@@ -342,6 +370,28 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "  fi",
         "  tailscale up \"${TAILSCALE_UP_ARGS[@]}\"",
         "fi",
+        "AUTH_STATUS_RAW=\"$JOB_ROOT/codex-login-status.raw.txt\"",
+        "AUTH_STATUS_REDACTED=\"$JOB_ROOT/codex-login-status.redacted.txt\"",
+        "set +e",
+        "AUTH_STATUS_OUTPUT=\"$(sudo -u \"$DBX_USER\" -H codex login status 2>&1)\"",
+        "AUTH_STATUS_EXIT=$?",
+        "set -e",
+        "printf '%s\\n' \"$AUTH_STATUS_OUTPUT\" > \"$AUTH_STATUS_RAW\"",
+        "if [ \"$AUTH_STATUS_EXIT\" -ne 0 ]; then",
+        "  redact_text_file \"$AUTH_STATUS_RAW\" \"$AUTH_STATUS_REDACTED\"",
+        "  write_status \"bootstrap\" \"blocked\" \"codex_auth_failed\"",
+        "  cat >\"$BLOCKER_FILE\" <<EOF",
+        "# Codex authentication failed",
+        "",
+        "Bootstrap could not verify Codex authentication for the ubuntu user.",
+        "",
+        "## codex login status",
+        "EOF",
+        "  cat \"$AUTH_STATUS_REDACTED\" >> \"$BLOCKER_FILE\"",
+        "  rm -f \"$AUTH_STATUS_RAW\" \"$AUTH_STATUS_REDACTED\"",
+        "  exit 0",
+        "fi",
+        "rm -f \"$AUTH_STATUS_RAW\" \"$AUTH_STATUS_REDACTED\"",
         "write_status \"bootstrap\" \"running\" \"starting tmux codex session\"",
         "sudo -u \"$DBX_USER\" -H tmux new-session -d -s \"$SESSION_NAME\" -c \"$REPO_DIR\"",
         "sudo -u \"$DBX_USER\" -H tmux pipe-pane -o -t \"$SESSION_NAME\":0.0 \"cat >> '$LOG_FILE'\"",
@@ -364,7 +414,7 @@ def build_user_data(config: AppConfig, request: JobLaunchRequest) -> str:
         "  fi",
         "fi",
         "sudo -u \"$DBX_USER\" -H tmux send-keys -t \"$SESSION_NAME\":0.0 /usr/local/bin/dbx-codex-watch C-m",
-        "write_status \"runtime\" \"ready\" \"tmux session started\"",
+        "write_status \"runtime\" \"starting\" \"waiting_for_agent_heartbeat\"",
     ]
     return "\n".join(script)
 
@@ -546,7 +596,7 @@ def _find_tag(instance: dict[str, object], key: str) -> str | None:
     return None
 
 
-def _build_bootstrap_prompt() -> str:
+def _build_bootstrap_prompt(session_name: str) -> str:
     return "\n".join(
         [
             "Continue and complete the task you were doing previously.",
@@ -579,11 +629,16 @@ def _build_bootstrap_prompt() -> str:
             "- before stopping, ensure the repository is clean or explicitly documented in STATUS.md",
             "",
             "Start by:",
-            "1. Inspecting the repository, mission file, and git status.",
-            "2. Writing a brief plan into STATUS.md or the nearest durable project artifact.",
-            "3. Continuing the task in coherent checkpoints.",
-            "4. Verifying each checkpoint before moving on.",
-            "5. Keeping the branch clean, reviewable, and resumable throughout the work.",
+            "1. Reading AGENT_MISSION.md, then immediately writing AGENT_STARTED.json in the job root.",
+            "   Use JSON with status, started_at, and session_name.",
+            "   Set \"status\": \"running\" and use the current ISO-8601 UTC timestamp.",
+            f"   Set \"session_name\": {json.dumps(session_name)}.",
+            "2. Updating status.json and STATUS.md to phase=runtime, state=running, detail=agent_heartbeat_received.",
+            "3. Inspecting the repository, mission file, and git status.",
+            "4. Writing a brief plan into STATUS.md or the nearest durable project artifact.",
+            "5. Continuing the task in coherent checkpoints.",
+            "6. Verifying each checkpoint before moving on.",
+            "7. Keeping the branch clean, reviewable, and resumable throughout the work.",
             "",
             "When the work is complete and verified:",
             "- update STATUS.md with the result and verification evidence",
@@ -600,6 +655,7 @@ def _build_bootstrap_prompt() -> str:
             "",
             "If Codex exits before you mark complete or blocked, dbx treats the stop as unknown, preserves the branch in a draft PR, and terminates only after PR confirmation.",
             "",
+            "The first heartbeat step is mandatory: write AGENT_STARTED.json before any repository command.",
             "Never stop without leaving a clear status note and a clean or explicitly documented git state.",
         ]
     )

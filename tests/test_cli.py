@@ -389,7 +389,7 @@ class CliTests(unittest.TestCase):
             ):
                 with patch(
                     "dbx.cli._wait_for_runtime_ready",
-                    return_value={"phase": "runtime", "state": "ready"},
+                    return_value={"phase": "runtime", "state": "running"},
                     create=True,
                 ) as wait:
                     with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
@@ -409,7 +409,7 @@ class CliTests(unittest.TestCase):
         wait.assert_called_once()
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["instance_id"], "i-123")
-        self.assertEqual(payload["runtime"]["state"], "ready")
+        self.assertEqual(payload["runtime"]["state"], "running")
 
     def test_start_without_args_runs_resume_wizard_with_configured_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -681,7 +681,7 @@ class CliTests(unittest.TestCase):
             ) as launch_instance:
                 with patch(
                     "dbx.cli._wait_for_runtime_ready",
-                    return_value={"phase": "runtime", "state": "ready"},
+                    return_value={"phase": "runtime", "state": "running"},
                     create=True,
                 ):
                     with patch("dbx.cli._codex_sessions_root", return_value=root):
@@ -891,7 +891,7 @@ class CliTests(unittest.TestCase):
                             with patch(
                                 "dbx.cli._capture_remote_artifacts",
                                 return_value={
-                                    "status_json": {"phase": "runtime", "state": "ready"},
+                                    "status_json": {"phase": "runtime", "state": "running"},
                                     "status_md": "# dbx-job\n",
                                     "blocker": None,
                                     "bootstrap_log": "boot\n",
@@ -907,7 +907,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["remote_status"]["state"], "ready")
+        self.assertEqual(payload["remote_status"]["state"], "running")
         self.assertEqual(payload["logs"]["codex"], "codex\n")
 
     def test_monitor_once_shows_only_git_status_and_codex_output(self) -> None:
@@ -1044,7 +1044,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("Git", rendered)
         self.assertIn("Codex output", rendered)
 
-    def test_wait_for_runtime_ready_reports_but_does_not_block_on_ec2_checks(self) -> None:
+    def test_wait_for_runtime_ready_succeeds_only_after_agent_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = cli.load_config(_write_sample_config(tmpdir))
             with patch(
@@ -1063,10 +1063,24 @@ class CliTests(unittest.TestCase):
                     },
                 ):
                     with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
-                        with patch("dbx.cli._remote_file_exists", return_value=True):
+                        with patch(
+                            "dbx.cli._remote_file_exists",
+                            side_effect=lambda _target, path: True,
+                        ):
                             with patch(
                                 "dbx.cli._read_remote_json",
-                                return_value={"phase": "runtime", "state": "ready"},
+                                side_effect=[
+                                    {
+                                        "phase": "runtime",
+                                        "state": "running",
+                                        "detail": "agent_heartbeat_received",
+                                    },
+                                    {
+                                        "status": "running",
+                                        "started_at": "2026-05-07T10:00:00Z",
+                                        "session_name": "dbx-job",
+                                    },
+                                ],
                             ):
                                 with patch(
                                     "dbx.cli._remote_tmux_session_exists",
@@ -1079,9 +1093,55 @@ class CliTests(unittest.TestCase):
                                         poll_interval_seconds=0,
                                     )
 
-        self.assertEqual(runtime["state"], "ready")
+        self.assertEqual(runtime["state"], "running")
+        self.assertEqual(runtime["heartbeat"]["status"], "running")
         self.assertEqual(runtime["system_status"], "initializing")
         self.assertEqual(runtime["instance_status"], "initializing")
+
+    def test_wait_for_runtime_ready_retries_after_transient_ssh_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = cli.load_config(_write_sample_config(tmpdir))
+            with patch(
+                "dbx.cli.describe_instance",
+                return_value={
+                    "InstanceId": "i-123",
+                    "State": {"Name": "running"},
+                    "Tags": [{"Key": "Name", "Value": "dbx-job"}],
+                },
+            ):
+                with patch("dbx.cli.describe_instance_status", return_value={}):
+                    with patch("dbx.cli.build_ssh_target", return_value="ubuntu@dbx-job"):
+                        with patch("dbx.cli._remote_file_exists", return_value=True):
+                            with patch(
+                                "dbx.cli._read_remote_json",
+                                side_effect=[
+                                    cli.RemoteCommandError("ssh handshake reset"),
+                                    {
+                                        "phase": "runtime",
+                                        "state": "running",
+                                        "detail": "agent_heartbeat_received",
+                                    },
+                                    {
+                                        "status": "running",
+                                        "started_at": "2026-05-07T10:00:00Z",
+                                        "session_name": "dbx-job",
+                                    },
+                                ],
+                            ):
+                                with patch(
+                                    "dbx.cli._remote_tmux_session_exists",
+                                    return_value=True,
+                                ):
+                                    with patch("dbx.cli.time.sleep") as sleep:
+                                        runtime = cli._wait_for_runtime_ready(
+                                            config,
+                                            _sample_job_state(),
+                                            timeout_seconds=2,
+                                            poll_interval_seconds=0,
+                                        )
+
+        self.assertEqual(runtime["state"], "running")
+        self.assertGreaterEqual(sleep.call_count, 1)
 
     def test_attach_check_reports_ready_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1149,7 +1209,7 @@ class CliTests(unittest.TestCase):
                                                 )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(saved_jobs[-1].status, "terminated")
+        self.assertEqual(saved_jobs[-1].status, "ready")
         self.assertEqual(saved_jobs[-1].lifecycle_state, "terminated")
 
     def test_terminate_continues_when_remote_artifact_capture_fails(self) -> None:
@@ -1215,6 +1275,248 @@ class CliTests(unittest.TestCase):
         ):
             with self.assertRaises(cli.RemoteCommandError):
                 cli._read_remote_json("ubuntu@dbx-job", "/tmp/status.json")
+
+    def test_start_terminates_on_blocked_runtime_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch(
+                "dbx.cli.launch_instance",
+                return_value={"Instances": [{"InstanceId": "i-123"}]},
+            ):
+                with patch(
+                    "dbx.cli._wait_for_runtime_ready",
+                    side_effect=cli.RuntimeLifecycleError(
+                        status="blocked",
+                        detail="codex_auth_failed",
+                        runtime={
+                            "status": "blocked",
+                            "detail": "codex_auth_failed",
+                            "artifacts": {"status_json": {"state": "blocked"}},
+                        },
+                    ),
+                ):
+                    with patch(
+                        "dbx.cli._terminate_job",
+                        return_value={"final_state": "terminated"},
+                    ) as terminate_job:
+                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                            exit_code = cli.main(
+                                [
+                                    "--config",
+                                    str(config_path),
+                                    "start",
+                                    "er-fo/db-x",
+                                    str(mission_path),
+                                ]
+                            )
+
+        self.assertEqual(exit_code, 1)
+        terminate_job.assert_called_once()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["detail"], "codex_auth_failed")
+        self.assertEqual(payload["termination"]["final_state"], "terminated")
+
+    def test_start_terminates_on_auth_failed_runtime_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch(
+                "dbx.cli.launch_instance",
+                return_value={"Instances": [{"InstanceId": "i-123"}]},
+            ):
+                with patch(
+                    "dbx.cli._wait_for_runtime_ready",
+                    side_effect=cli.RuntimeLifecycleError(
+                        status="auth_failed",
+                        detail="codex login required",
+                        runtime={
+                            "status": "auth_failed",
+                            "detail": "codex login required",
+                            "artifacts": {"codex_log": "Error: login required\n"},
+                        },
+                    ),
+                ):
+                    with patch(
+                        "dbx.cli._terminate_job",
+                        return_value={"final_state": "terminated"},
+                    ):
+                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                            exit_code = cli.main(
+                                [
+                                    "--config",
+                                    str(config_path),
+                                    "start",
+                                    "er-fo/db-x",
+                                    str(mission_path),
+                                ]
+                            )
+
+        self.assertEqual(exit_code, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "auth_failed")
+        self.assertEqual(payload["lifecycle_state"], "terminated")
+
+    def test_start_timeout_terminates_and_preserves_timeout_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch(
+                "dbx.cli.launch_instance",
+                return_value={"Instances": [{"InstanceId": "i-123"}]},
+            ):
+                with patch(
+                    "dbx.cli._wait_for_runtime_ready",
+                    side_effect=cli.RuntimeLifecycleError(
+                        status="timeout",
+                        detail="waiting_for_agent_heartbeat",
+                        runtime={
+                            "status": "timeout",
+                            "detail": "waiting_for_agent_heartbeat",
+                            "artifacts": {"codex_log": "still starting\n"},
+                        },
+                    ),
+                ):
+                    with patch(
+                        "dbx.cli._terminate_job",
+                        return_value={"final_state": "terminated"},
+                    ):
+                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                            exit_code = cli.main(
+                                [
+                                    "--config",
+                                    str(config_path),
+                                    "start",
+                                    "er-fo/db-x",
+                                    str(mission_path),
+                                ]
+                            )
+
+        self.assertEqual(exit_code, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "timeout")
+        self.assertEqual(payload["lifecycle_state"], "terminated")
+        self.assertEqual(payload["termination"]["final_state"], "terminated")
+
+    def test_capture_remote_artifacts_collects_logs_even_when_status_json_is_invalid(self) -> None:
+        with patch(
+            "dbx.cli._read_remote_json",
+            side_effect=cli.RemoteCommandError("Remote JSON artifact was invalid"),
+        ):
+            with patch(
+                "dbx.cli._read_remote_text",
+                side_effect=["# status\n", "blocked details\n"],
+            ):
+                with patch(
+                    "dbx.cli._tail_remote_text",
+                    side_effect=["boot\n", "codex\n", "finish\n"],
+                ):
+                    artifacts = cli._capture_remote_artifacts(
+                        "ubuntu@dbx-job",
+                        _sample_job_state(),
+                        include_logs=True,
+                    )
+
+        self.assertIsNone(artifacts["status_json"])
+        self.assertEqual(artifacts["status_md"], "# status\n")
+        self.assertEqual(artifacts["codex_log"], "codex\n")
+        self.assertIn("status_json", artifacts["errors"])
+
+    def test_persist_remote_artifacts_redacts_secrets_before_saving(self) -> None:
+        artifacts = {
+            "status_json": {"phase": "runtime", "state": "blocked", "detail": "auth"},
+            "blocker": "token ghp_1234567890abcdefghijklmnopqrstuvwxyz leaks",
+            "codex_log": "TAILSCALE_AUTH_KEY=tskey-auth-123\nOPENAI_API_KEY=sk-proj-secret\n",
+        }
+
+        with patch("dbx.cli.save_job_artifact") as save_artifact:
+            cli._persist_remote_artifacts("i-123", artifacts)
+
+        saved_contents = {call.args[1]: call.args[2] for call in save_artifact.call_args_list}
+        self.assertIn("BLOCKER.md", saved_contents)
+        self.assertIn("[REDACTED]", saved_contents["BLOCKER.md"])
+        self.assertIn("[REDACTED]", saved_contents["codex.log"])
+        self.assertNotIn("ghp_", saved_contents["BLOCKER.md"])
+        self.assertNotIn("sk-proj-secret", saved_contents["codex.log"])
+
+    def test_list_includes_local_terminated_jobs_not_visible_in_aws(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            local_job = JobState(
+                instance_id="i-local",
+                job_name="dbx-local",
+                repo="er-fo/db-x",
+                branch_name="agent/local",
+                session_name="dbx-local",
+                mission_path="/tmp/mission.md",
+                created_at="2026-05-07T10:00:00Z",
+                job_root="/home/ubuntu/work/dbx-local",
+                lifecycle_state="terminated",
+                status="timeout",
+                terminated_at="2026-05-07T10:10:00Z",
+            )
+            with patch("dbx.cli.list_instances", return_value=[]):
+                with patch("dbx.cli.list_job_states", return_value=[local_job]):
+                    with patch("sys.stdout", new=io.StringIO()) as stdout:
+                        exit_code = cli.main(["--config", str(config_path), "list"])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload[0]["instance_id"], "i-local")
+        self.assertEqual(payload[0]["status"], "timeout")
+        self.assertEqual(payload[0]["lifecycle_state"], "terminated")
+
+    def test_status_falls_back_to_local_state_and_saved_artifacts_for_terminated_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            local_job = JobState(
+                instance_id="i-terminated",
+                job_name="dbx-local",
+                repo="er-fo/db-x",
+                branch_name="agent/local",
+                session_name="dbx-local",
+                mission_path="/tmp/mission.md",
+                created_at="2026-05-07T10:00:00Z",
+                job_root="/home/ubuntu/work/dbx-local",
+                lifecycle_state="terminated",
+                status="auth_failed",
+                last_error="codex login required",
+                terminated_at="2026-05-07T10:10:00Z",
+            )
+            with patch(
+                "dbx.cli.describe_instance",
+                side_effect=cli.AwsCliError("Instance not found"),
+            ):
+                with patch("dbx.cli.load_job_state", return_value=local_job):
+                    with patch(
+                        "dbx.cli.load_job_artifacts",
+                        return_value={
+                            "status.json": '{\n  "state": "blocked"\n}\n',
+                            "BLOCKER.md": "codex auth failed\n",
+                            "codex.log": "Error: login required\n",
+                        },
+                    ):
+                        with patch("sys.stdout", new=io.StringIO()) as stdout:
+                            exit_code = cli.main(
+                                ["--config", str(config_path), "status", "i-terminated", "--logs"]
+                            )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["instance_id"], "i-terminated")
+        self.assertEqual(payload["status"], "auth_failed")
+        self.assertEqual(payload["lifecycle_state"], "terminated")
+        self.assertEqual(payload["remote_status"]["state"], "blocked")
+        self.assertIn("codex", payload["logs"])
 
 
 def _sample_config() -> str:

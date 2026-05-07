@@ -15,6 +15,7 @@ import sys
 import termios
 import time
 import tty
+from typing import Callable
 
 from .aws import (
     AwsCliError,
@@ -35,11 +36,12 @@ from .ssh import upload_remote_text
 from .state import (
     JobState,
     created_at_now,
+    list_job_states,
+    load_job_artifacts,
     load_job_state,
     save_job_artifact,
     save_job_state,
 )
-
 
 PICK_SESSION = "__dbx_pick_session__"
 SESSION_LIST_LIMIT = 10
@@ -92,6 +94,38 @@ class WizardMenuOption:
     key: str
     label: str
     detail: str = ""
+
+
+REMOTE_READY_STATES = {"running", "ready"}
+REMOTE_NON_SUCCESS_STATES = {"blocked", "failed", "auth_failed", "timeout"}
+
+_REDACTION_PATTERNS = (
+    re.compile(r"tskey-auth-[A-Za-z0-9_-]+"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"ASIA[0-9A-Z]{16}"),
+    re.compile(r"aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+=]{20,}", re.IGNORECASE),
+    re.compile(r"OPENAI_API_KEY\s*[=:]\s*[^\s]+", re.IGNORECASE),
+    re.compile(r"CODEX_(?:AUTH|API|TOKEN)[A-Z_]*\s*[=:]\s*[^\s]+", re.IGNORECASE),
+    re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{12,}"),
+)
+
+_CODEX_AUTH_FAILURE_PATTERNS = (
+    re.compile(r"codex login", re.IGNORECASE),
+    re.compile(r"authentication failed", re.IGNORECASE),
+    re.compile(r"not logged in", re.IGNORECASE),
+    re.compile(r"login required", re.IGNORECASE),
+    re.compile(r"invalid api key", re.IGNORECASE),
+)
+
+
+class RuntimeLifecycleError(RuntimeError):
+    def __init__(self, *, status: str, detail: str, runtime: dict[str, object]) -> None:
+        super().__init__(f"{status}: {detail}")
+        self.status = status
+        self.detail = detail
+        self.runtime = runtime
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -523,14 +557,62 @@ def run_start(
 
     runtime = None
     if wait:
-        runtime = _wait_for_runtime_ready(config, job_state, timeout_seconds=timeout_seconds)
-        job_state = replace(
-            job_state,
-            lifecycle_state="running",
-            status=str(runtime.get("state", "ready")),
-            last_error=None,
-        )
-        save_job_state(job_state)
+        try:
+            runtime = _wait_for_runtime_ready(
+                config,
+                job_state,
+                timeout_seconds=timeout_seconds,
+            )
+            job_state = replace(
+                job_state,
+                lifecycle_state="running",
+                status=str(runtime.get("state", "running")),
+                last_error=None,
+            )
+            save_job_state(job_state)
+        except RuntimeLifecycleError as exc:
+            termination: dict[str, object]
+            lifecycle_state = "terminated"
+            try:
+                termination = _terminate_job(
+                    config,
+                    instance_id,
+                    wait=True,
+                    force=False,
+                    status_override=exc.status,
+                    last_error=exc.detail,
+                )
+            except (AwsCliError, RemoteCommandError) as terminate_exc:
+                lifecycle_state = "termination_failed"
+                termination = {"error": _redact_text(str(terminate_exc))}
+                save_job_state(
+                    replace(
+                        job_state,
+                        lifecycle_state=lifecycle_state,
+                        status=exc.status,
+                        last_error=exc.detail,
+                    )
+                )
+            output = {
+                "job_name": job_name,
+                "branch_name": branch_name,
+                "session_name": session_name,
+                "instance_id": instance_id,
+                "resume_session_id": resume_session_id,
+                "status": exc.status,
+                "detail": exc.detail,
+                "lifecycle_state": lifecycle_state,
+                "termination": termination,
+                "artifacts": _artifact_excerpts(
+                    exc.runtime.get("artifacts")
+                    if isinstance(exc.runtime.get("artifacts"), dict)
+                    else {}
+                ),
+            }
+            if resume_session_upload is not None:
+                output["resume_session_upload"] = resume_session_upload
+            _print_json(output)
+            return 1
 
     output = {
         "job_name": job_name,
@@ -543,7 +625,7 @@ def run_start(
         output["resume_session_upload"] = resume_session_upload
     if runtime is not None:
         output["runtime"] = runtime
-    print(json.dumps(output, indent=2))
+    _print_json(output)
     if monitor:
         return run_monitor(config, instance_id, output_stream=sys.stderr)
     return 0
@@ -551,28 +633,55 @@ def run_start(
 
 def run_list(config: AppConfig) -> int:
     instances = list_instances(config)
-    simplified = []
+    by_instance_id: dict[str, dict[str, object]] = {}
     for instance in instances:
         instance_id = instance.get("InstanceId")
         local_state = (
             load_job_state(instance_id) if isinstance(instance_id, str) and instance_id else None
         )
-        simplified.append(
-            {
-                "instance_id": instance_id,
-                "state": ((instance.get("State") or {}).get("Name")),
-                "name": _find_name(instance),
-                "launch_time": instance.get("LaunchTime"),
-                "repo": local_state.repo if local_state else None,
-                "branch_name": local_state.branch_name if local_state else None,
-                "mission_path": local_state.mission_path if local_state else None,
-                "resume_session_id": local_state.resume_session_id if local_state else None,
-                "lifecycle_state": local_state.lifecycle_state if local_state else None,
-                "status": local_state.status if local_state else None,
-                "pr_url": local_state.pr_url if local_state else None,
-            }
-        )
-    print(json.dumps(simplified, indent=2, default=str))
+        by_instance_id[str(instance_id)] = {
+            "instance_id": instance_id,
+            "state": ((instance.get("State") or {}).get("Name")),
+            "name": _find_name(instance),
+            "launch_time": instance.get("LaunchTime"),
+            "repo": local_state.repo if local_state else None,
+            "branch_name": local_state.branch_name if local_state else None,
+            "mission_path": local_state.mission_path if local_state else None,
+            "resume_session_id": local_state.resume_session_id if local_state else None,
+            "lifecycle_state": local_state.lifecycle_state if local_state else None,
+            "status": local_state.status if local_state else None,
+            "pr_url": local_state.pr_url if local_state else None,
+        }
+
+    for local_state in list_job_states():
+        if local_state.instance_id in by_instance_id:
+            continue
+        if (
+            local_state.lifecycle_state != "terminated"
+            and local_state.status not in REMOTE_NON_SUCCESS_STATES
+        ):
+            continue
+        by_instance_id[local_state.instance_id] = {
+            "instance_id": local_state.instance_id,
+            "state": None,
+            "name": local_state.job_name,
+            "launch_time": local_state.created_at,
+            "repo": local_state.repo,
+            "branch_name": local_state.branch_name,
+            "mission_path": local_state.mission_path,
+            "resume_session_id": local_state.resume_session_id,
+            "lifecycle_state": local_state.lifecycle_state,
+            "status": local_state.status,
+            "pr_url": local_state.pr_url,
+            "terminated_at": local_state.terminated_at,
+        }
+
+    simplified = sorted(
+        by_instance_id.values(),
+        key=lambda item: str(item.get("launch_time") or ""),
+        reverse=True,
+    )
+    _print_json(simplified)
     return 0
 
 
@@ -1352,7 +1461,7 @@ def _remote_codex_session_path(config: AppConfig, relative_path: str) -> str:
 
 def run_status(config: AppConfig, job_id: str, *, include_logs: bool = False) -> int:
     summary = _build_status_summary(config, job_id, include_logs=include_logs)
-    print(json.dumps(summary, indent=2, default=str))
+    _print_json(summary)
     return 0
 
 
@@ -1519,7 +1628,7 @@ def run_finish(
     else:
         output["termination"] = {"skipped": True}
 
-    print(json.dumps(output, indent=2, default=str))
+    _print_json(output)
     return 0
 
 
@@ -1531,7 +1640,7 @@ def run_terminate(
     force: bool = False,
 ) -> int:
     payload = _terminate_job(config, job_id, wait=wait, force=force)
-    print(json.dumps(payload, indent=2, default=str))
+    _print_json(payload)
     return 0
 
 
@@ -1544,57 +1653,135 @@ def _wait_for_runtime_ready(
 ) -> dict[str, object]:
     deadline = time.time() + timeout_seconds
     last_problem = "waiting for EC2 launch"
+    last_detail = "waiting_for_ec2_launch"
+    paths = _remote_paths(job_state)
 
     while time.time() < deadline:
-        instance = describe_instance(config, job_state.instance_id)
-        instance_state = ((instance.get("State") or {}).get("Name"))
-        if instance_state != "running":
-            last_problem = f"instance state is {instance_state}"
-            time.sleep(poll_interval_seconds)
-            continue
-
-        status = describe_instance_status(config, job_state.instance_id) or {}
-        target = build_ssh_target(config, instance)
         try:
-            if not _remote_file_exists(target, "/var/lib/cloud/instance/boot-finished"):
-                last_problem = "cloud-init has not finished"
+            instance = describe_instance(config, job_state.instance_id)
+            instance_state = ((instance.get("State") or {}).get("Name"))
+            if instance_state != "running":
+                last_problem = f"instance state is {instance_state}"
+                last_detail = str(instance_state or "instance_not_running")
                 time.sleep(poll_interval_seconds)
                 continue
 
-            remote_status = _read_remote_json(target, _remote_paths(job_state)["status_json"])
-            if str(remote_status.get("state")) != "ready":
-                last_problem = f"remote runtime state is {remote_status.get('state')}"
+            status = describe_instance_status(config, job_state.instance_id) or {}
+            target = build_ssh_target(config, instance)
+            if not _remote_file_exists(target, "/var/lib/cloud/instance/boot-finished"):
+                last_problem = "cloud-init has not finished"
+                last_detail = "cloud_init_incomplete"
+                time.sleep(poll_interval_seconds)
+                continue
+
+            remote_status = _read_remote_json(target, paths["status_json"])
+            remote_state = str(remote_status.get("state") or "")
+            remote_detail = str(remote_status.get("detail") or "")
+            if remote_state in REMOTE_NON_SUCCESS_STATES:
+                artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
+                _persist_remote_artifacts(job_state.instance_id, artifacts)
+                raise RuntimeLifecycleError(
+                    status=remote_state,
+                    detail=remote_detail or remote_state,
+                    runtime={
+                        "status": remote_state,
+                        "detail": remote_detail or remote_state,
+                        "ssh_target": target,
+                        "artifacts": artifacts,
+                    },
+                )
+            if remote_state not in REMOTE_READY_STATES:
+                last_problem = (
+                    f"remote runtime state is {remote_state}"
+                    if remote_state
+                    else "remote runtime state is unavailable"
+                )
+                last_detail = remote_detail or remote_state or "runtime_not_ready"
                 time.sleep(poll_interval_seconds)
                 continue
 
             if not _remote_tmux_session_exists(target, job_state.session_name):
                 last_problem = "tmux session is not ready"
+                last_detail = "tmux_session_not_ready"
                 time.sleep(poll_interval_seconds)
                 continue
 
             if not _remote_file_exists(target, _remote_paths(job_state)["codex_log"]):
                 last_problem = "codex log has not been created"
+                last_detail = "codex_log_missing"
+                time.sleep(poll_interval_seconds)
+                continue
+
+            codex_log = _tail_remote_text(target, paths["codex_log"], optional=True)
+            if isinstance(codex_log, str) and _log_has_codex_auth_failure(codex_log):
+                artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
+                _persist_remote_artifacts(job_state.instance_id, artifacts)
+                raise RuntimeLifecycleError(
+                    status="auth_failed",
+                    detail="codex_auth_failed",
+                    runtime={
+                        "status": "auth_failed",
+                        "detail": "codex_auth_failed",
+                        "ssh_target": target,
+                        "artifacts": artifacts,
+                    },
+                )
+
+            if not _remote_file_exists(target, paths["agent_started_json"]):
+                last_problem = "agent heartbeat has not been written"
+                last_detail = "waiting_for_agent_heartbeat"
+                time.sleep(poll_interval_seconds)
+                continue
+
+            heartbeat = _read_remote_json(target, paths["agent_started_json"])
+            heartbeat_status = str(heartbeat.get("status") or "")
+            if heartbeat_status not in REMOTE_READY_STATES:
+                last_problem = (
+                    f"agent heartbeat status is {heartbeat_status}"
+                    if heartbeat_status
+                    else "agent heartbeat status is unavailable"
+                )
+                last_detail = heartbeat_status or "waiting_for_agent_heartbeat"
                 time.sleep(poll_interval_seconds)
                 continue
 
             return {
                 "phase": remote_status.get("phase", "runtime"),
-                "state": remote_status.get("state", "ready"),
+                "state": remote_state or heartbeat_status,
+                "detail": remote_detail or "agent_heartbeat_received",
                 "ssh_target": target,
+                "heartbeat": heartbeat,
                 "cloud_init_complete": True,
                 "tmux_session": job_state.session_name,
                 "codex_log_ready": True,
                 "system_status": (status.get("SystemStatus") or {}).get("Status"),
                 "instance_status": (status.get("InstanceStatus") or {}).get("Status"),
             }
-        except RemoteCommandError as exc:
+        except RuntimeLifecycleError:
+            raise
+        except (AwsCliError, RemoteCommandError) as exc:
             last_problem = str(exc)
+            last_detail = "transient_remote_error"
             time.sleep(poll_interval_seconds)
 
     console_output = _console_output_excerpt(config, job_state.instance_id)
-    raise AwsCliError(
-        f"Timed out waiting for runtime verification on {job_state.instance_id}. "
-        f"Last problem: {last_problem}. Console output: {console_output}"
+    artifacts = _best_effort_runtime_artifacts(config, job_state)
+    if console_output:
+        artifacts["console_output_excerpt"] = console_output
+        save_job_artifact(
+            job_state.instance_id,
+            "console-output.txt",
+            console_output + "\n",
+        )
+    raise RuntimeLifecycleError(
+        status="timeout",
+        detail=last_detail,
+        runtime={
+            "status": "timeout",
+            "detail": last_detail,
+            "last_problem": last_problem,
+            "artifacts": artifacts,
+        },
     )
 
 
@@ -1604,7 +1791,11 @@ def _build_status_summary(
     *,
     include_logs: bool = False,
 ) -> dict[str, object]:
-    instance = describe_instance(config, job_id)
+    try:
+        instance = describe_instance(config, job_id)
+    except AwsCliError as exc:
+        return _build_local_status_summary(job_id, include_logs=include_logs, aws_error=str(exc))
+
     local_state = _load_or_infer_job_state(config, instance, job_id)
     instance_status = describe_instance_status(config, job_id) or {}
     summary: dict[str, object] = {
@@ -1635,6 +1826,8 @@ def _build_status_summary(
         summary["remote_status"] = artifacts.get("status_json")
         summary["status_markdown"] = artifacts.get("status_md")
         summary["blocker"] = artifacts.get("blocker")
+        if isinstance(artifacts.get("errors"), dict) and artifacts["errors"]:
+            summary["artifact_errors"] = artifacts["errors"]
         if include_logs:
             summary["logs"] = {
                 "bootstrap": artifacts.get("bootstrap_log"),
@@ -1654,9 +1847,12 @@ def _terminate_job(
     *,
     wait: bool,
     force: bool,
+    status_override: str | None = None,
+    last_error: str | None = None,
 ) -> dict[str, object]:
     instance = describe_instance(config, job_id)
     local_state = _load_or_infer_job_state(config, instance, job_id)
+    artifacts: dict[str, object] = {}
 
     if not force:
         try:
@@ -1667,16 +1863,20 @@ def _terminate_job(
             console_output = _console_output_excerpt(config, job_id)
             if console_output:
                 save_job_artifact(job_id, "console-output.txt", console_output + "\n")
+                artifacts["console_output_excerpt"] = console_output
 
     payload = terminate_instance(config, job_id)
     if wait:
         final_instance = wait_for_instance_terminated(config, job_id)
         payload["final_state"] = ((final_instance.get("State") or {}).get("Name"))
+    if artifacts:
+        payload["artifacts"] = _artifact_excerpts(artifacts)
 
     updated_state = replace(
         local_state,
         lifecycle_state="terminated",
-        status="terminated",
+        status=status_override or local_state.status,
+        last_error=last_error,
         terminated_at=created_at_now(),
     )
     save_job_state(updated_state)
@@ -1690,15 +1890,38 @@ def _capture_remote_artifacts(
     include_logs: bool,
 ) -> dict[str, object]:
     paths = _remote_paths(job_state)
-    artifacts: dict[str, object] = {
-        "status_json": _read_remote_json(target, paths["status_json"]),
-        "status_md": _read_remote_text(target, paths["status_md"]),
-        "blocker": _read_remote_text(target, paths["blocker"], optional=True),
-    }
+    artifacts: dict[str, object] = {"errors": {}}
+    artifacts["status_json"] = _capture_artifact(
+        artifacts,
+        "status_json",
+        lambda: _read_remote_json(target, paths["status_json"]),
+    )
+    artifacts["status_md"] = _capture_artifact(
+        artifacts,
+        "status_md",
+        lambda: _read_remote_text(target, paths["status_md"]),
+    )
+    artifacts["blocker"] = _capture_artifact(
+        artifacts,
+        "blocker",
+        lambda: _read_remote_text(target, paths["blocker"], optional=True),
+    )
     if include_logs:
-        artifacts["bootstrap_log"] = _tail_remote_text(target, paths["bootstrap_log"])
-        artifacts["codex_log"] = _tail_remote_text(target, paths["codex_log"])
-        artifacts["finish_log"] = _tail_remote_text(target, paths["finish_log"], optional=True)
+        artifacts["bootstrap_log"] = _capture_artifact(
+            artifacts,
+            "bootstrap_log",
+            lambda: _tail_remote_text(target, paths["bootstrap_log"]),
+        )
+        artifacts["codex_log"] = _capture_artifact(
+            artifacts,
+            "codex_log",
+            lambda: _tail_remote_text(target, paths["codex_log"]),
+        )
+        artifacts["finish_log"] = _capture_artifact(
+            artifacts,
+            "finish_log",
+            lambda: _tail_remote_text(target, paths["finish_log"], optional=True),
+        )
     return artifacts
 
 
@@ -1753,18 +1976,27 @@ def _persist_remote_artifacts(job_id: str, artifacts: dict[str, object]) -> None
         save_job_artifact(
             job_id,
             "status.json",
-            json.dumps(artifacts["status_json"], indent=2) + "\n",
+            _redact_text(json.dumps(artifacts["status_json"], indent=2) + "\n"),
         )
     if "status_md" in artifacts and isinstance(artifacts["status_md"], str):
-        save_job_artifact(job_id, "STATUS.md", artifacts["status_md"])
+        save_job_artifact(job_id, "STATUS.md", _redact_text(artifacts["status_md"]))
     if "blocker" in artifacts and isinstance(artifacts["blocker"], str):
-        save_job_artifact(job_id, "BLOCKER.md", artifacts["blocker"])
+        save_job_artifact(job_id, "BLOCKER.md", _redact_text(artifacts["blocker"]))
     if "bootstrap_log" in artifacts and isinstance(artifacts["bootstrap_log"], str):
-        save_job_artifact(job_id, "bootstrap.log", artifacts["bootstrap_log"])
+        save_job_artifact(job_id, "bootstrap.log", _redact_text(artifacts["bootstrap_log"]))
     if "codex_log" in artifacts and isinstance(artifacts["codex_log"], str):
-        save_job_artifact(job_id, "codex.log", artifacts["codex_log"])
+        save_job_artifact(job_id, "codex.log", _redact_text(artifacts["codex_log"]))
     if "finish_log" in artifacts and isinstance(artifacts["finish_log"], str):
-        save_job_artifact(job_id, "finish.log", artifacts["finish_log"])
+        save_job_artifact(job_id, "finish.log", _redact_text(artifacts["finish_log"]))
+    errors = artifacts.get("errors")
+    if isinstance(errors, dict):
+        for name, message in errors.items():
+            if isinstance(message, str) and message:
+                save_job_artifact(
+                    job_id,
+                    f"{name}.error.txt",
+                    _redact_text(message) + "\n",
+                )
 
 
 def _run_finish_remote(
@@ -1836,6 +2068,7 @@ def _remote_paths(job_state: JobState) -> dict[str, str]:
     return {
         "repo_dir": f"{job_root}/repo",
         "status_json": f"{job_root}/status.json",
+        "agent_started_json": f"{job_root}/AGENT_STARTED.json",
         "status_md": f"{job_root}/STATUS.md",
         "blocker": f"{job_root}/BLOCKER.md",
         "bootstrap_log": f"{job_root}/logs/bootstrap.log",
@@ -1912,7 +2145,7 @@ def _console_output_excerpt(config: AppConfig, job_id: str, limit: int = 400) ->
     if not output:
         return ""
     compact = " ".join(output.split())
-    return compact[:limit]
+    return _redact_text(compact[:limit])
 
 
 def _job_root(config: AppConfig, job_name: str) -> str:
@@ -1987,6 +2220,123 @@ def _aws_identity_command(config: AppConfig) -> list[str]:
         ]
     )
     return command
+
+
+def _capture_artifact(
+    artifacts: dict[str, object],
+    name: str,
+    reader: Callable[[], object],
+) -> object:
+    try:
+        return reader()
+    except (AwsCliError, RemoteCommandError) as exc:
+        errors = artifacts.setdefault("errors", {})
+        if isinstance(errors, dict):
+            errors[name] = _redact_text(str(exc))
+        return None
+
+
+def _best_effort_runtime_artifacts(
+    config: AppConfig,
+    job_state: JobState,
+) -> dict[str, object]:
+    try:
+        instance = describe_instance(config, job_state.instance_id)
+        target = build_ssh_target(config, instance)
+        artifacts = _capture_remote_artifacts(target, job_state, include_logs=True)
+        _persist_remote_artifacts(job_state.instance_id, artifacts)
+        return artifacts
+    except (AwsCliError, RemoteCommandError):
+        return {}
+
+
+def _log_has_codex_auth_failure(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _CODEX_AUTH_FAILURE_PATTERNS)
+
+
+def _redact_text(text: str) -> str:
+    redacted = text
+    for pattern in _REDACTION_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def _redact_value(value: object) -> object:
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, dict):
+        return {key: _redact_value(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    return value
+
+
+def _artifact_excerpts(artifacts: dict[str, object]) -> dict[str, object]:
+    excerpts: dict[str, object] = {}
+    for key in ("status_json", "status_md", "blocker", "bootstrap_log", "codex_log", "finish_log"):
+        value = artifacts.get(key)
+        if isinstance(value, dict):
+            excerpts[key] = value
+        elif isinstance(value, str) and value:
+            excerpts[key] = _redact_text(value[:200])
+    errors = artifacts.get("errors")
+    if isinstance(errors, dict) and errors:
+        excerpts["errors"] = {name: _redact_text(str(message)) for name, message in errors.items()}
+    if isinstance(artifacts.get("console_output_excerpt"), str):
+        excerpts["console_output_excerpt"] = _redact_text(
+            str(artifacts["console_output_excerpt"])[:200]
+        )
+    return excerpts
+
+
+def _print_json(payload: object) -> None:
+    print(json.dumps(_redact_value(payload), indent=2, default=str))
+
+
+def _build_local_status_summary(
+    job_id: str,
+    *,
+    include_logs: bool,
+    aws_error: str,
+) -> dict[str, object]:
+    local_state = load_job_state(job_id)
+    if local_state is None:
+        raise AwsCliError(aws_error)
+    artifacts = load_job_artifacts(job_id)
+    remote_status = None
+    if "status.json" in artifacts:
+        try:
+            parsed = json.loads(artifacts["status.json"])
+            remote_status = parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            remote_status = None
+    summary: dict[str, object] = {
+        "instance_id": local_state.instance_id,
+        "name": local_state.job_name,
+        "state": None,
+        "launch_time": local_state.created_at,
+        "repo": local_state.repo,
+        "branch_name": local_state.branch_name,
+        "mission_path": local_state.mission_path,
+        "resume_session_id": local_state.resume_session_id,
+        "job_root": local_state.job_root,
+        "lifecycle_state": local_state.lifecycle_state,
+        "status": local_state.status,
+        "pr_url": local_state.pr_url,
+        "last_error": local_state.last_error,
+        "terminated_at": local_state.terminated_at,
+        "aws_error": _redact_text(aws_error),
+        "remote_status": remote_status,
+        "status_markdown": artifacts.get("STATUS.md"),
+        "blocker": artifacts.get("BLOCKER.md"),
+    }
+    if include_logs:
+        summary["logs"] = {
+            "bootstrap": artifacts.get("bootstrap.log"),
+            "codex": artifacts.get("codex.log"),
+            "finish": artifacts.get("finish.log"),
+        }
+    return summary
 
 
 if __name__ == "__main__":
