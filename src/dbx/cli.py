@@ -547,13 +547,32 @@ def run_start(
     save_job_state(job_state)
     resume_session_upload = None
     if resume_session_file and resume_session_relative_path:
-        resume_session_upload = _upload_resume_session_when_reachable(
-            config,
-            job_state,
-            resume_session_file,
-            resume_session_relative_path,
-            timeout_seconds=timeout_seconds,
-        )
+        try:
+            resume_session_upload = _upload_resume_session_when_reachable(
+                config,
+                job_state,
+                resume_session_file,
+                resume_session_relative_path,
+                timeout_seconds=timeout_seconds,
+            )
+        except AwsCliError as exc:
+            status, detail = _classify_resume_upload_failure(exc)
+            lifecycle_state, termination = _terminate_after_start_failure(
+                config,
+                job_state,
+                status=status,
+                detail=detail,
+            )
+            _print_json(
+                _build_start_failure_output(
+                    job_state,
+                    status=status,
+                    detail=detail,
+                    lifecycle_state=lifecycle_state,
+                    termination=termination,
+                )
+            )
+            return 1
 
     runtime = None
     if wait:
@@ -571,47 +590,27 @@ def run_start(
             )
             save_job_state(job_state)
         except RuntimeLifecycleError as exc:
-            termination: dict[str, object]
-            lifecycle_state = "terminated"
-            try:
-                termination = _terminate_job(
-                    config,
-                    instance_id,
-                    wait=True,
-                    force=False,
-                    status_override=exc.status,
-                    last_error=exc.detail,
+            lifecycle_state, termination = _terminate_after_start_failure(
+                config,
+                job_state,
+                status=exc.status,
+                detail=exc.detail,
+            )
+            _print_json(
+                _build_start_failure_output(
+                    job_state,
+                    status=exc.status,
+                    detail=exc.detail,
+                    lifecycle_state=lifecycle_state,
+                    termination=termination,
+                    resume_session_upload=resume_session_upload,
+                    artifacts=(
+                        exc.runtime.get("artifacts")
+                        if isinstance(exc.runtime.get("artifacts"), dict)
+                        else {}
+                    ),
                 )
-            except (AwsCliError, RemoteCommandError) as terminate_exc:
-                lifecycle_state = "termination_failed"
-                termination = {"error": _redact_text(str(terminate_exc))}
-                save_job_state(
-                    replace(
-                        job_state,
-                        lifecycle_state=lifecycle_state,
-                        status=exc.status,
-                        last_error=exc.detail,
-                    )
-                )
-            output = {
-                "job_name": job_name,
-                "branch_name": branch_name,
-                "session_name": session_name,
-                "instance_id": instance_id,
-                "resume_session_id": resume_session_id,
-                "status": exc.status,
-                "detail": exc.detail,
-                "lifecycle_state": lifecycle_state,
-                "termination": termination,
-                "artifacts": _artifact_excerpts(
-                    exc.runtime.get("artifacts")
-                    if isinstance(exc.runtime.get("artifacts"), dict)
-                    else {}
-                ),
-            }
-            if resume_session_upload is not None:
-                output["resume_session_upload"] = resume_session_upload
-            _print_json(output)
+            )
             return 1
 
     output = {
@@ -629,6 +628,72 @@ def run_start(
     if monitor:
         return run_monitor(config, instance_id, output_stream=sys.stderr)
     return 0
+
+
+def _classify_resume_upload_failure(exc: AwsCliError) -> tuple[str, str]:
+    detail = _redact_text(str(exc))
+    text = str(exc).lower()
+    status = "timeout" if "timed out" in text or "timeout" in text else "blocked"
+    return status, detail
+
+
+def _terminate_after_start_failure(
+    config: AppConfig,
+    job_state: JobState,
+    *,
+    status: str,
+    detail: str,
+) -> tuple[str, dict[str, object]]:
+    lifecycle_state = "terminated"
+    try:
+        termination = _terminate_job(
+            config,
+            job_state.instance_id,
+            wait=True,
+            force=False,
+            status_override=status,
+            last_error=detail,
+        )
+    except (AwsCliError, RemoteCommandError) as terminate_exc:
+        lifecycle_state = "termination_failed"
+        termination = {"error": _redact_text(str(terminate_exc))}
+        save_job_state(
+            replace(
+                job_state,
+                lifecycle_state=lifecycle_state,
+                status=status,
+                last_error=detail,
+            )
+        )
+    return lifecycle_state, termination
+
+
+def _build_start_failure_output(
+    job_state: JobState,
+    *,
+    status: str,
+    detail: str,
+    lifecycle_state: str,
+    termination: dict[str, object],
+    resume_session_upload: dict[str, object] | None = None,
+    artifacts: dict[str, object] | None = None,
+) -> dict[str, object]:
+    output = {
+        "job_name": job_state.job_name,
+        "branch_name": job_state.branch_name,
+        "session_name": job_state.session_name,
+        "instance_id": job_state.instance_id,
+        "resume_session_id": job_state.resume_session_id,
+        "status": status,
+        "detail": detail,
+        "lifecycle_state": lifecycle_state,
+        "termination": termination,
+    }
+    if resume_session_upload is not None:
+        output["resume_session_upload"] = resume_session_upload
+    if artifacts:
+        output["artifacts"] = _artifact_excerpts(artifacts)
+    return output
 
 
 def run_list(config: AppConfig) -> int:

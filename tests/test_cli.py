@@ -778,6 +778,67 @@ class CliTests(unittest.TestCase):
             "/home/ubuntu/.codex/sessions/2026/05/06/session.jsonl",
         )
 
+    def test_start_terminates_when_resume_upload_times_out_after_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                created_at="2026-05-06T16:23:44Z",
+                latest_user_message="resume this session",
+                mtime=100,
+                branch="feature/base",
+            )
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            with patch("dbx.cli._codex_sessions_root", return_value=root):
+                with patch(
+                    "dbx.cli.launch_instance",
+                    return_value={"Instances": [{"InstanceId": "i-123"}]},
+                ):
+                    with patch(
+                        "dbx.cli._upload_resume_session_when_reachable",
+                        side_effect=cli.AwsCliError(
+                            "Timed out uploading Codex resume session to i-123. "
+                            "Last problem: tskey-auth-secret"
+                        ),
+                    ):
+                        with patch(
+                            "dbx.cli._terminate_job",
+                            return_value={"final_state": "terminated"},
+                        ) as terminate_job:
+                            with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                exit_code = cli.main(
+                                    [
+                                        "--config",
+                                        str(config_path),
+                                        "start",
+                                        "--resume-session",
+                                        "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                                        "er-fo/db-x",
+                                        str(mission_path),
+                                    ]
+                                )
+
+        self.assertEqual(exit_code, 1)
+        terminate_job.assert_called_once()
+        self.assertEqual(terminate_job.call_args.args[1], "i-123")
+        self.assertEqual(terminate_job.call_args.kwargs["wait"], True)
+        self.assertEqual(terminate_job.call_args.kwargs["force"], False)
+        self.assertEqual(terminate_job.call_args.kwargs["status_override"], "timeout")
+        self.assertIn("[REDACTED]", terminate_job.call_args.kwargs["last_error"])
+        self.assertNotIn("tskey-auth-secret", terminate_job.call_args.kwargs["last_error"])
+        self.assertEqual(terminate_job.call_args.kwargs["last_error"], json.loads(stdout.getvalue())["detail"])
+        self.assertNotIn("tskey-auth-secret", stdout.getvalue())
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["instance_id"], "i-123")
+        self.assertEqual(payload["resume_session_id"], "019dfdac-5bea-71f0-91c5-4fdd8826860b")
+        self.assertEqual(payload["status"], "timeout")
+        self.assertEqual(payload["lifecycle_state"], "terminated")
+        self.assertEqual(payload["termination"]["final_state"], "terminated")
+
     def test_finish_command_dispatches_to_run_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
