@@ -100,6 +100,15 @@ class AwsTests(unittest.TestCase):
         self.assertIn("sudo -u \"$DBX_USER\" -H tmux new-session", script)
         self.assertIn("tmux pipe-pane -o", script)
         self.assertNotIn("| tee '$LOG_FILE'", script)
+        self.assertIn("Continue and complete the task you were doing previously.", script)
+        self.assertIn("You have been moved onto a disposable VM devbox.", script)
+        self.assertIn("You are authorized to prepare this VM environment as needed:", script)
+        self.assertIn("Git hygiene is mandatory:", script)
+        self.assertIn("commit completed checkpoints when they are verified", script)
+        self.assertIn(
+            "Never stop without leaving a clear status note and a clean or explicitly documented git state.",
+            script,
+        )
 
     def test_build_user_data_waits_for_agent_heartbeat_before_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
