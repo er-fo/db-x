@@ -472,12 +472,16 @@ def run_start(
     job_root = _job_root(config, job_name)
     resume_session_file = None
     resume_session_relative_path = None
+    base_branch = config.default_base_branch
     if resume_session_id:
         resume_session_file = _find_codex_session_file(resume_session_id)
         if resume_session_file is None:
             print(f"Codex session not found locally: {resume_session_id}", file=sys.stderr)
             return 2
         resume_session_relative_path = _codex_session_relative_path(resume_session_file)
+        resume_session = _load_codex_session_file(resume_session_file)
+        if resume_session and resume_session.branch and resume_session.branch != "-":
+            base_branch = resume_session.branch
 
     request = JobLaunchRequest(
         repo=repo,
@@ -487,6 +491,7 @@ def run_start(
         session_name=session_name,
         resume_session_id=resume_session_id,
         resume_session_relative_path=resume_session_relative_path,
+        base_branch=base_branch,
     )
     payload = launch_instance(config, request)
     instances = payload.get("Instances", [])
@@ -501,6 +506,7 @@ def run_start(
         created_at=created_at_now(),
         resume_session_id=resume_session_id,
         job_root=job_root,
+        base_branch=base_branch,
         lifecycle_state="launching",
         status="starting",
     )
@@ -1484,7 +1490,7 @@ def run_finish(
     finish_result = _run_finish_remote(
         target,
         job_state,
-        config.default_base_branch,
+        job_state.base_branch or config.default_base_branch,
         no_pr=no_pr,
         blocked=blocked,
     )
@@ -1770,52 +1776,12 @@ def _run_finish_remote(
     blocked: bool,
 ) -> dict[str, object]:
     paths = _remote_paths(job_state)
-    commit_message = _finish_commit_message(job_state.job_name)
-    pr_title_prefix = "BLOCKED: " if blocked else ""
-    pr_draft_line = "gh pr create --draft" if blocked else "gh pr create"
+    mode = "blocked" if blocked else "complete"
+    no_pr_arg = " --no-pr" if no_pr else ""
     script = "\n".join(
         [
             "set -euo pipefail",
-            f"JOB_ROOT={shlex.quote(job_state.job_root)}",
-            f"REPO_DIR={shlex.quote(paths['repo_dir'])}",
-            f"STATUS_FILE={shlex.quote(paths['status_md'])}",
-            f"STATUS_JSON={shlex.quote(paths['status_json'])}",
-            f"BLOCKER_FILE={shlex.quote(paths['blocker'])}",
-            f"FINISH_LOG={shlex.quote(paths['finish_log'])}",
-            f"BRANCH_NAME={shlex.quote(job_state.branch_name)}",
-            f"BASE_BRANCH={shlex.quote(base_branch)}",
-            f"NO_PR={'1' if no_pr else '0'}",
-            "PR_BODY_FILE=\"$JOB_ROOT/PR_BODY.md\"",
-            "mkdir -p \"$(dirname \"$FINISH_LOG\")\"",
-            "exec > >(tee -a \"$FINISH_LOG\") 2>&1",
-            "cd \"$REPO_DIR\"",
-            "if [ -n \"$(git status --porcelain)\" ]; then",
-            "  git add -A",
-            f"  git commit -m {shlex.quote(commit_message)}",
-            "fi",
-            "git push -u origin \"$BRANCH_NAME\"",
-            "TITLE=\"" + pr_title_prefix + "$(git log -1 --pretty=%s)\"",
-            "cat >\"$PR_BODY_FILE\" <<'EOF'",
-            "## dbx finish",
-            "",
-            f"- Job: `{job_state.job_name}`",
-            f"- Branch: `{job_state.branch_name}`",
-            "",
-            "## Status",
-            "EOF",
-            "cat \"$STATUS_FILE\" >> \"$PR_BODY_FILE\"",
-            "if [ -f \"$BLOCKER_FILE\" ]; then",
-            "  printf '\\n## Blocker\\n\\n' >> \"$PR_BODY_FILE\"",
-            "  cat \"$BLOCKER_FILE\" >> \"$PR_BODY_FILE\"",
-            "fi",
-            "if [ \"$NO_PR\" = \"0\" ]; then",
-            "  EXISTING_PR_URL=\"$(gh pr view \"$BRANCH_NAME\" --json url --jq '.url' 2>/dev/null || true)\"",
-            "  if [ -n \"$EXISTING_PR_URL\" ]; then",
-            "    gh pr edit \"$BRANCH_NAME\" --title \"$TITLE\" --body-file \"$PR_BODY_FILE\"",
-            "  else",
-            f"    {pr_draft_line} --base \"$BASE_BRANCH\" --head \"$BRANCH_NAME\" --title \"$TITLE\" --body-file \"$PR_BODY_FILE\"",
-            "  fi",
-            "fi",
+            f"/usr/local/bin/dbx-finish-job --mode {shlex.quote(mode)} --base {shlex.quote(base_branch)}{no_pr_arg}",
         ]
     )
     run_remote_shell_command(target, script)
@@ -1859,6 +1825,7 @@ def _load_or_infer_job_state(
         mission_path="",
         created_at=created_at,
         job_root=_job_root(config, job_name),
+        base_branch=config.default_base_branch,
         lifecycle_state="discovered",
         status=str(((instance.get("State") or {}).get("Name")) or "unknown"),
     )

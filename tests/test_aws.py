@@ -162,6 +162,39 @@ class AwsTests(unittest.TestCase):
         )
         self.assertIn("waiting for codex resume session upload", script)
 
+    def test_build_user_data_installs_auto_finish_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            mission_path = Path(tmpdir) / "mission.md"
+            config_path.write_text(_sample_config(), encoding="utf-8")
+            mission_path.write_text("# Mission\nShip it.\n", encoding="utf-8")
+            config = load_config(str(config_path))
+            request = JobLaunchRequest(
+                repo="er-fo/db-x",
+                mission_path=mission_path,
+                job_name="dbx-ship-123",
+                branch_name="agent/ship-123",
+                session_name="dbx-ship-123",
+                base_branch="feature/base",
+            )
+
+            script = build_user_data(config, request)
+
+        self.assertIn("BASE_BRANCH=feature/base", script)
+        self.assertIn("/usr/local/bin/dbx-finish-ready", script)
+        self.assertIn("/usr/local/bin/dbx-finish-job", script)
+        self.assertIn("/usr/local/bin/dbx-codex-watch", script)
+        self.assertIn("codex_hooks = true", script)
+        self.assertIn("hooks.json", script)
+        self.assertIn('"event": "Stop"', script)
+        self.assertIn("DBX_FINISH_READY", script)
+        self.assertIn("flock -n 9", script)
+        self.assertIn("git status --porcelain", script)
+        self.assertIn("gh pr create --draft", script)
+        self.assertIn("gh pr create --base \"$BASE_BRANCH\"", script)
+        self.assertIn("shutdown -h now", script)
+        self.assertIn("dbx-codex-watch", script)
+
 
 def _sample_config() -> str:
     return """

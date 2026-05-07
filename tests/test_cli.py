@@ -661,6 +661,15 @@ class CliTests(unittest.TestCase):
 
     def test_start_forwards_resume_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / ".codex" / "sessions"
+            _write_codex_session(
+                root,
+                session_id="019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                created_at="2026-05-06T16:23:44Z",
+                latest_user_message="resume this work",
+                mtime=100,
+                branch="feature/base",
+            )
             config_path = Path(tmpdir) / "config.toml"
             mission_path = Path(tmpdir) / "mission.md"
             config_path.write_text(_sample_config(), encoding="utf-8")
@@ -675,40 +684,30 @@ class CliTests(unittest.TestCase):
                     return_value={"phase": "runtime", "state": "ready"},
                     create=True,
                 ):
-                    with patch(
-                        "dbx.cli._find_codex_session_file",
-                        return_value=Path("/tmp/session.jsonl"),
-                    ):
-                        with patch(
-                            "dbx.cli._codex_session_relative_path",
-                            return_value=(
-                                "2026/05/06/rollout-2026-05-06T16-23-44-"
-                                "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
-                            ),
-                        ):
+                    with patch("dbx.cli._codex_sessions_root", return_value=root):
+                        with patch("dbx.cli._upload_resume_session_when_reachable") as upload_session:
+                            upload_session.return_value = {
+                                "remote_path": (
+                                    "/home/ubuntu/.codex/sessions/2026/05/06/"
+                                    "rollout-2026-05-06T16-23-44-"
+                                    "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+                                )
+                            }
                             with patch(
-                                "dbx.cli._upload_resume_session_when_reachable",
-                                return_value={
-                                    "remote_path": (
-                                        "/home/ubuntu/.codex/sessions/2026/05/06/"
-                                        "rollout-2026-05-06T16-23-44-"
-                                        "019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl"
+                                "dbx.cli.save_job_state", side_effect=saved_jobs.append
+                            ):
+                                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                                    exit_code = cli.main(
+                                        [
+                                            "--config",
+                                            str(config_path),
+                                            "start",
+                                            "--resume-session",
+                                            "019dfdac-5bea-71f0-91c5-4fdd8826860b",
+                                            "er-fo/db-x",
+                                            str(mission_path),
+                                        ]
                                     )
-                                },
-                            ) as upload_session:
-                                with patch("dbx.cli.save_job_state", side_effect=saved_jobs.append):
-                                    with patch("sys.stdout", new=io.StringIO()) as stdout:
-                                        exit_code = cli.main(
-                                            [
-                                                "--config",
-                                                str(config_path),
-                                                "start",
-                                                "--resume-session",
-                                                "019dfdac-5bea-71f0-91c5-4fdd8826860b",
-                                                "er-fo/db-x",
-                                                str(mission_path),
-                                            ]
-                                        )
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(saved_jobs)
@@ -726,6 +725,8 @@ class CliTests(unittest.TestCase):
             request.resume_session_relative_path,
             "2026/05/06/rollout-2026-05-06T16-23-44-019dfdac-5bea-71f0-91c5-4fdd8826860b.jsonl",
         )
+        self.assertEqual(request.base_branch, "feature/base")
+        self.assertEqual(saved_jobs[-1].base_branch, "feature/base")
         upload_session.assert_called_once()
 
     def test_start_fails_when_requested_resume_session_is_not_local(self) -> None:
@@ -839,6 +840,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(saved_jobs[-1].pr_url, "https://github.com/er-fo/db-x/pull/1")
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["termination"]["final_state"], "terminated")
+
+    def test_finish_remote_delegates_to_vm_finish_script(self) -> None:
+        job_state = _sample_job_state()
+        with patch("dbx.cli.run_remote_shell_command") as run_remote:
+            with patch(
+                "dbx.cli._read_remote_command_output",
+                return_value="https://github.com/er-fo/db-x/pull/1\n",
+            ):
+                result = cli._run_finish_remote(
+                    "ubuntu@dbx-job",
+                    job_state,
+                    "feature/base",
+                    no_pr=False,
+                    blocked=True,
+                )
+
+        self.assertEqual(result["pr_url"], "https://github.com/er-fo/db-x/pull/1")
+        remote_script = run_remote.call_args.args[1]
+        self.assertIn("/usr/local/bin/dbx-finish-job", remote_script)
+        self.assertIn("--mode blocked", remote_script)
+        self.assertIn("--base feature/base", remote_script)
 
     def test_status_includes_remote_logs_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1226,6 +1248,7 @@ def _sample_job_state() -> JobState:
         mission_path="/tmp/mission.md",
         created_at="2026-05-06T12:00:00Z",
         job_root="/home/ubuntu/work/dbx-job",
+        base_branch="feature/base",
         lifecycle_state="running",
         status="ready",
     )
@@ -1240,6 +1263,7 @@ def _write_codex_session(
     mtime: int,
     extra_user_message: str | None = None,
     source: object = "cli",
+    branch: str = "main",
 ) -> Path:
     date_part, time_part = created_at.removesuffix("Z").split("T")
     year, month, day = date_part.split("-")
@@ -1253,7 +1277,7 @@ def _write_codex_session(
             "payload": {
                 "timestamp": created_at,
                 "cwd": "/tmp/repo",
-                "git": {"branch": "main"},
+                "git": {"branch": branch},
                 "source": source,
             },
         },

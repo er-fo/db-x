@@ -19,6 +19,7 @@ class StateTests(unittest.TestCase):
                 session_name="dbx-job",
                 mission_path="/tmp/mission.md",
                 job_root="/home/ubuntu/work/dbx-job",
+                base_branch="feature/base",
                 created_at="2026-05-06T12:00:00Z",
                 lifecycle_state="running",
                 status="ready",
@@ -52,6 +53,7 @@ class StateTests(unittest.TestCase):
             loaded = load_job_state("i-123", state_dir=state_dir)
 
         self.assertEqual(loaded.job_root, "")
+        self.assertEqual(loaded.base_branch, "main")
         self.assertEqual(loaded.lifecycle_state, "created")
         self.assertIsNone(loaded.pr_url)
         self.assertIsNone(loaded.terminated_at)
