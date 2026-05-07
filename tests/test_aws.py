@@ -326,12 +326,17 @@ class AwsTests(unittest.TestCase):
             script = build_user_data(config, request)
 
         self.assertIn("DBX_PREFLIGHT_OK", script)
+        self.assertIn("text.count('DBX_PREFLIGHT_OK') >= 2", script)
         self.assertIn("codex_hook_config_invalid", script)
         self.assertIn("codex_preflight_failed", script)
         self.assertIn("MCP startup incomplete", script)
         self.assertIn("failed to parse hooks config", script)
         self.assertIn('write_status "bootstrap" "blocked"', script)
+        self.assertIn('chown "$DBX_USER":"$DBX_USER" "$STATUS_JSON" "$STATUS_FILE"', script)
         self.assertIn("preflight.log tail", script)
+        self.assertIn("trap - ERR", script)
+        self.assertIn("write_preflight_status()", script)
+        self.assertIn("redact_preflight_tail()", script)
 
 
 def _sample_config() -> str:
